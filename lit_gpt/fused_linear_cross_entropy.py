@@ -5,7 +5,7 @@
 import torch
 import triton
 
-from liger_kernel.ops.cross_entropy import (
+from .ops.cross_entropy import (
     element_mul_kernel,
     liger_cross_entropy_kernel,
 )

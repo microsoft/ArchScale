@@ -4,20 +4,22 @@
 
 echo "START TIME: $(date)"
 
-MODEL=$1
+SEED=$1
+
+MODEL=$2
 # supported models:
 # #deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
 # deepseek-ai/DeepSeek-R1-Distill-Llama-8B
 # deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 # deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
-TASK=$2
+TASK=$3
 # supported tasks:
 # aime24
 # math_500
 # gpqa_diamond
 
-OUTPUT_ROOT=$3
+OUTPUT_ROOT=$4
 
 #export CUDA_VISIBLE_DEVICES=1,2,3,4
 get_gpu_count() {
@@ -39,7 +41,10 @@ get_gpu_count() {
 }
 
 NUM_GPUS=$(get_gpu_count)
-MODEL_ARGS="seed=1,model_name=$MODEL,max_num_batched_tokens=32768,dtype=bfloat16,data_parallel_size=$NUM_GPUS,max_model_length=32768,gpu_memory_utilization=0.8,trust_remote_code=True,generation_parameters={max_new_tokens:32768,temperature:0.6,top_p:0.95}"
+# temp 0.6
+MODEL_ARGS="seed=$SEED,model_name=$MODEL,max_num_batched_tokens=32768,dtype=bfloat16,data_parallel_size=$NUM_GPUS,max_model_length=32768,gpu_memory_utilization=0.8,trust_remote_code=True,generation_parameters={max_new_tokens:32768,temperature:0.6,top_p:0.95}"
+# temp 0
+#MODEL_ARGS="pretrained=$MODEL,dtype=bfloat16,data_parallel_size=$NUM_GPUS,max_model_length=32768,gpu_memory_utilization=0.95,trust_remote_code=True,temperature=0"
 OUTPUT_DIR=$OUTPUT_ROOT/$MODEL
 
 # force crashing on nccl issues like hanging broadcast

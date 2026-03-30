@@ -7,7 +7,20 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from flash_attn import flash_attn_func, flash_attn_varlen_func
+compute_capability = torch.cuda.get_device_capability()
+sm_version = compute_capability[0] * 10 + compute_capability[1]
+if sm_version == 100:
+    import flash_attn.cute as flash_attn_interface
+elif sm_version == 90:
+    try:
+        import flash_attn_interface
+    except:
+        from flash_attn import flash_attn_interface
+else:
+    from flash_attn import flash_attn_interface
+
+flash_attn_func = flash_attn_interface.flash_attn_func
+flash_attn_varlen_func = flash_attn_interface.flash_attn_varlen_func
 
 def lambda_init_fn(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
@@ -55,13 +68,29 @@ class FlashDiffAttention(nn.Module):
         self.window_size = window_size
         self.deterministic = deterministic
 
+        self.depth = depth
         self.lambda_init = lambda_init_fn(depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32))
 
         self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+
+    def reset_parameters(self) -> None:
+        """Initialize FlashDiffAttention parameters."""
+        # Re-compute lambda_init in case depth changed
+        self.lambda_init = lambda_init_fn(self.depth)
+        
+        # Initialize lambda parameters with normal(mean=0, std=0.1)
+        nn.init.normal_(self.lambda_q1, mean=0, std=0.1)
+        nn.init.normal_(self.lambda_k1, mean=0, std=0.1)
+        nn.init.normal_(self.lambda_q2, mean=0, std=0.1)
+        nn.init.normal_(self.lambda_k2, mean=0, std=0.1)
+        
+        # Initialize subln (RMSNorm)
+        if hasattr(self.subln, 'reset_parameters'):
+            self.subln.reset_parameters()
 
     def forward(
         self,

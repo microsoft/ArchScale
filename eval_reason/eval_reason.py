@@ -1,6 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT license.
-
 # Copyright 2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -6,41 +6,51 @@
 
 import math
 from typing import Any, List, Optional, Tuple
+from functools import partial
 import numpy as np
 
 import torch
 import torch.nn as nn
 from typing_extensions import Self
 from lit_gpt.config import Config
-from .fused_rotary_embedding import apply_rotary_emb_func
+
+import utils
+# from xformers.ops import SwiGLU
+from .attention import CausalSelfAttention, RoPECache, KVCache, build_rope_cache
 from torch import Tensor
 from .mamba_simple import Mamba
-from functools import partial
-from einops import rearrange
-import torch.nn.functional as F
+from .gla import GatedLinearAttention
+from .moe import MoE, get_moe
 
+# Optional SonicMoE Experts import for initialization handling
 try:
-    from causal_conv1d import causal_conv1d_fn
+    from .moe import Experts as SonicMoEExperts
 except:
-    causal_conv1d_fn = None
+    SonicMoEExperts = None
+from .delta_net import DeltaNet
+from .multiscale_retention import MultiScaleRetention
+import transformer_engine.pytorch as te
+import torch.nn.functional as F
+try:
+    from .gated_deltanet import GatedDeltaNet
+except:
+    GatedDeltaNet = None
     
-from .diff_attn import FlashDiffAttention
-from flash_attn.modules.mha import FlashCrossAttention
-from flash_attn.bert_padding import pad_input, unpad_input
-torch._dynamo.config.capture_scalar_outputs = True
-unpad_input =torch.compiler.disable(unpad_input)
-pad_input = torch.compiler.disable(pad_input)
+try:
+    from .mega import S6GatedAttention
+    from .relu2_attn_glu import Relu2Attention, Relu2MLP
+    from .mamba2 import Mamba2
+except:
+    S6GatedAttention, Relu2Attention, Relu2MLP, Mamba2 = None, None, None, None
 
-from .mamba2 import Mamba2
-from .gated_memory_unit import swiglu, GMUWrapper
-from .gated_deltanet import GatedDeltaNet
+from lit_gpt.config import RMSNormFunc
+
+from .gated_memory_unit import swiglu, GMU, GMUWrapper
+from .layer_configurator import LayerConfigurator
 import copy
 from collections import namedtuple
 
-CausalLMOutput = namedtuple("CausalLMOutput", ["logits", "weight"], defaults=[None, None])
-RoPECache = Tuple[torch.Tensor, torch.Tensor]
-KVCache = Tuple[torch.Tensor, torch.Tensor]
-
+CausalLMOutput = namedtuple("CausalLMOutput", ["logits", "weight"], defaults=[None, None])        
 
 def truncated_normal_(tensor, mean=0.0, std=0.02):
    
@@ -58,8 +68,34 @@ def get_rnn(config: Config, layer_idx: int, gmu_save: bool = False, **factory_kw
         return Mamba2(config.n_embd, expand=mamba2_expand, layer_idx=layer_idx, gmu_save=gmu_save, config=config, **factory_kwargs)
     elif config.rnn_type == "gdn":
         return GatedDeltaNet(hidden_size=config.n_embd, num_heads=math.ceil(int(config.n_embd*0.75)/256), head_dim=256, mode='chunk', gmu_save=gmu_save, use_short_conv=True, allow_neg_eigval=True)
+    #TODO: add support of gmu for rnns below
+    elif config.rnn_type == "retnet": 
+        return MultiScaleRetention(hidden_size=config.n_embd, num_heads=config.n_head // 2, expand_k=1, expand_v=2, mode='fused_chunk', use_short_conv=False)
+    elif config.rnn_type == "gla":
+        return GatedLinearAttention(hidden_size=config.n_embd, num_heads=config.n_embd // 384, expand_k=0.5, expand_v=1, mode='fused_chunk', use_short_conv=False)
+    elif config.rnn_type == "delta":
+        return DeltaNet(hidden_size=config.n_embd, num_heads=9, expand_k=1.5, expand_v=1.5, mode='chunk', use_short_conv=True)
     else:
-        raise ValueError(f"Unknown RNN type: {config.rnn_type}. Supported types: mamba, mamba2, gdn")
+        raise ValueError(f"Unknown RNN type: {config.rnn_type}. Supported types: mamba, mamba2, retnet, gla, delta, gdn")
+
+
+def compute_rmsnorm(x: torch.Tensor) -> torch.Tensor:
+    """Compute RMSNorm (root mean square) of a tensor."""
+    return torch.sqrt(torch.mean(x.float() ** 2) + 1e-30)
+
+
+def compute_outlier_percentage(x: torch.Tensor, sigma: float = 5.0) -> torch.Tensor:
+    """Compute percentage of outlier elements using the N-sigma rule, per token.
+    
+    For a tensor of shape (B, T, D), computes mean and std across the D dimension
+    for each token, then counts elements where |x - mean| > sigma * std.
+    Returns the overall outlier percentage as a scalar.
+    """
+    x = x.float()
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True)
+    outliers = (x - mean).abs() > sigma * std
+    return outliers.float().mean() * 100.0
 
 
 class GPT(nn.Module):
@@ -68,15 +104,25 @@ class GPT(nn.Module):
         assert config.padded_vocab_size is not None
         self.config = config
         self.mup = config.mup
-        
-        if config.mup:
+        self.shadow_init = config.shadow_init
+        self.super_mup = config.super_mup
+        if config.mup and not config.use_muonh:
             self.logit_scale = config.mup_d0 / config.n_layer 
         else:
             self.logit_scale = 1.0
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
 
-        num_layer = config.n_layer 
-
+        if config.lc and config.sparsity > 1:
+            new_config = copy.deepcopy(config)
+            new_config.n_layer = config.n_layer * config.sparsity
+            config = new_config
+        if config.share_per_layer>0:
+            num_layer = config.share_per_layer * config.share_group
+        else:
+            num_layer = config.n_layer 
+        if config.moe:
+            self.n_attn = [ 0 for i in range(num_layer)] 
+            self.n_mlp = [ config.sparsity * config.top_k for i in range(num_layer)] 
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
@@ -84,6 +130,11 @@ class GPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
+        self.layer_configurator = None
+        if config.lc and config.lc_shared:
+            self.layer_configurator = LayerConfigurator(config)
+        # Unified LC gate history at model level (store raw gates with grad)
+        self.lc_gate_hist = []
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[torch.Tensor] = None
         self.kv_caches: List[KVCache] = []
@@ -92,52 +143,78 @@ class GPT(nn.Module):
         self.tied_embed = config.tied_embed
         if self.tied_embed:
             self.tie_weights()
-
-    def _init_weights(self, module: nn.Module, n_layer) -> None:
-        """Meant to be used with `gpt.apply(gpt._init_weights)`."""
-        if isinstance(module, nn.Embedding):
-            std = 1e-4 # RWKV init
-            if self.tied_embed:
-                std = 0.02
-            if self.scale_embed:
-                std = std /math.sqrt(self.config.n_embd)
-            torch.nn.init.normal_(module.weight, std=std)
-        elif isinstance(module, nn.Linear):
-            if not self.mup:
-                torch.nn.init.normal_(module.weight, std=0.02)
-            #truncated_normal_(module.weight, mean=0.0, std=0.02)
-            #nn.init.kaiming_normal_(module.weight, nonlinearity="linear")
-            with torch.no_grad():
-                module.weight *= self.config.w_init0 
-                # if self.mup: # only needed for non kaiming init
-                #     module.weight *=  math.sqrt(self.config.mup_d0/self.config.n_layer)
-            if module.bias is not None:
-                if not getattr(module.bias, "_no_reinit", False):
-                    nn.init.zeros_(module.bias) 
-        if self.mup and not self.tied_embed:
-            for name, p in module.named_parameters():
-                if "lm_head" in name:
-                    torch.nn.init.zeros_(p)  # mup zero_readout trick
-        else:
-            # GPT-2 per-layer output projection intialization multiplier
-            for name, p in module.named_parameters():
-                if (name == "out_proj.weight") \
-                    or (name == "o_proj.weight") \
-                        or (name == "proj.weight" and isinstance(module, LLaMAMLP)) \
-                        or name == "w3.weight" \
-                        or (name=="proj.weight" and isinstance(module, CausalSelfAttention)):       
-                        #if use xformer swiglu, fc2 layer will be renamed to w3       
-                    if not self.config.mlp:
-                        n_residuals_per_layer = 1  
-                    else:
-                        n_residuals_per_layer = 2
-                    #nn.init.kaiming_uniform_(p, a=math.sqrt(5))
-                    with torch.no_grad():
-                        p /= math.sqrt(n_residuals_per_layer * n_layer)
-
+                
     def tie_weights(self):
         self.lm_head.weight = self.transformer.wte.weight
+    
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        """Initialize all parameters. Called after model is moved from meta device."""
+        # Initialize embedding (RWKV-style init)
+        std = 1e-4  # RWKV init
+        if self.tied_embed:
+            std = 0.02
+        if self.scale_embed:
+            std = std / math.sqrt(self.config.n_embd)
+        nn.init.normal_(self.transformer.wte.weight, std=std)
         
+        # Initialize lm_head
+        if not self.tied_embed:
+            utils.torch_default_init(self.lm_head.weight)
+            if self.lm_head.bias is not None:
+                nn.init.zeros_(self.lm_head.bias)
+        
+        # Initialize final layer norm
+        if hasattr(self.transformer.ln_f, 'reset_parameters'):
+            self.transformer.ln_f.reset_parameters()
+        
+        # Initialize all blocks
+        for block in self.transformer.h:
+            block.reset_parameters()
+        
+        # Initialize layer_configurator if present
+        if self.layer_configurator is not None:
+            self.layer_configurator.reset_parameters()
+        
+        # Apply custom initialization logic
+        n_layer = self.config.n_layer
+        # mup zero_readout trick for lm_head
+        if self.mup and not self.tied_embed:
+            if self.config.head_init_std is not None:
+                nn.init.normal_(self.lm_head.weight, std=self.config.head_init_std)
+            else:
+                nn.init.zeros_(self.lm_head.weight)
+        else:
+            for name, p in self.named_parameters():
+                if p.requires_grad:
+                    # Apply per-layer output projection scaling (GPT-2 style)
+                    if (name.endswith("out_proj.weight") or 
+                        name.endswith("o_proj.weight") or 
+                        name.endswith("proj.weight") or
+                        name.endswith("w3.weight")):
+                        if not self.config.mlp:
+                            n_residuals_per_layer = 1  
+                        else:
+                            n_residuals_per_layer = 2   
+                        p /= math.sqrt(n_residuals_per_layer * n_layer)
+        
+        # Apply w_init_scale multiplier for Linear weights
+        # Include SonicMoE Experts (3D weight tensors) for consistent initialization
+        weight_module_types = (nn.Linear, te.GroupedLinear)
+        if SonicMoEExperts is not None:
+            weight_module_types = weight_module_types + (SonicMoEExperts,)
+        for name, p in self.named_parameters():
+            if p.requires_grad and "weight" in name:
+                parent_name = name.rsplit('.', 1)[0]
+                parent_module = self.get_submodule(parent_name)
+                if isinstance(parent_module, weight_module_types):
+                    if not self.mup:
+                        nn.init.normal_(p, std=0.02)
+                    p.data *= self.config.w_init_scale
+        
+        # Re-tie weights if using tied embeddings
+        if self.tied_embed:
+            self.tie_weights()
     
     def reset_cache(self) -> None:
         self.max_len = self.config.block_size
@@ -148,7 +225,12 @@ class GPT(nn.Module):
             self.mask_cache = None
 
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, attn_mask: Optional[torch.Tensor] = None
+        self,
+        idx: torch.Tensor,
+        max_seq_length: Optional[int] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        residual_dropout: float = 0.0,
+        use_flce_loss: bool = False,
     ) -> torch.Tensor:
 
         B, T = idx.size()
@@ -160,37 +242,98 @@ class GPT(nn.Module):
         if max_seq_length is None:
             max_seq_length = block_size
 
-        if not self.config.nope:
+        if self.config.nope or self.config.ada_rope:
+            rope = None
+        else:
             if self.rope_cache is None:
                 self.rope_cache = self.build_rope_cache(idx, self.max_len)
-            elif T> self.max_len:
+            if T > self.max_len:
                 self.max_len = T
                 self.rope_cache = self.build_rope_cache(idx, self.max_len)
             cos, sin = self.rope_cache   
-
-        if not self.config.nope:
             cos = cos[:T]
             sin = sin[:T]
-        if self.config.nope:
-            rope = None
-        else:
             rope = (cos, sin)
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         if self.scale_embed:
             x = x * math.sqrt(self.config.n_embd)
-
+        input_embed = x
         kv_cache = None
         gmu_mems = None
-        for block in self.transformer.h:
-            x, kv_cache, gmu_mems = block(x, rope, max_seq_length, attn_mask, kv_cache = kv_cache, gmu_mems = gmu_mems)
+        # reset unified histories
+        self.lc_gate_hist = []
+        self.tokens_per_expert = []
+        self.token_indices = []
+        self.aux_loss = 0.0 # load balance loss
+        # reset output RMSNorm, outlier, and LSE tracking
+        self.attn_output_rmsnorms = []
+        self.mlp_output_rmsnorms = []
+        self.attn_outlier_pcts = []
+        self.mlp_outlier_pcts = []
+        self.attn_z_means = []
+        self.router_z_means = []
+        
+        if self.config.share_per_layer>0:
+            for i in range(self.config.share_group):
+                for _ in range(self.config.n_layer // self.config.share_group // self.config.share_per_layer):
+                    for block in self.transformer.h[i*self.config.share_per_layer:(i+1)*self.config.share_per_layer]:
+                        x, kv_cache, gmu_mems, input_embed = block(
+                            x,
+                            input_embed,
+                            rope,
+                            max_seq_length,
+                            attn_mask,
+                            lc=self.layer_configurator,
+                            kv_cache=kv_cache,
+                            gmu_mems=gmu_mems,
+                            residual_dropout=residual_dropout,
+                            lc_gate_hist=self.lc_gate_hist,
+                        )
+                        self.attn_output_rmsnorms.append(block.attn_output_rmsnorm)
+                        self.mlp_output_rmsnorms.append(block.mlp_output_rmsnorm)
+                        self.attn_outlier_pcts.append(block.attn_outlier_pct)
+                        self.mlp_outlier_pcts.append(block.mlp_outlier_pct)
+                        self.attn_z_means.append(block.attn_z_mean)
+                        self.router_z_means.append(block.router_z_mean)
+                        if self.config.moe:
+                            self.aux_loss = self.aux_loss + block.mlp.aux_loss
+                            self.token_indices.append(block.mlp.token_indices)
+                            self.tokens_per_expert.append(block.mlp.tokens_per_expert) # E # for logging
+        else:
+            for block in self.transformer.h:
+                x, kv_cache, gmu_mems, input_embed = block(
+                    x,
+                    input_embed,
+                    rope,
+                    max_seq_length,
+                    attn_mask,
+                    lc=self.layer_configurator,
+                    kv_cache=kv_cache,
+                    gmu_mems=gmu_mems,
+                    residual_dropout=residual_dropout,
+                    lc_gate_hist=self.lc_gate_hist,
+                )
+                self.attn_output_rmsnorms.append(block.attn_output_rmsnorm)
+                self.mlp_output_rmsnorms.append(block.mlp_output_rmsnorm)
+                self.attn_outlier_pcts.append(block.attn_outlier_pct)
+                self.mlp_outlier_pcts.append(block.mlp_outlier_pct)
+                self.attn_z_means.append(block.attn_z_mean)
+                self.router_z_means.append(block.router_z_mean)
+                if self.config.moe:
+                    self.aux_loss = self.aux_loss + block.mlp.aux_loss
+                    self.token_indices.append(block.mlp.token_indices)
+                    self.tokens_per_expert.append(block.mlp.tokens_per_expert) # E # for logging
 
-        x = self.transformer.ln_f(x.to(dtype=self.transformer.ln_f.weight.dtype))
+        if self.config.sum_skip: 
+            x = input_embed
+
+        x = self.transformer.ln_f(x.to(dtype=self.lm_head.weight.dtype))
         x = x * self.logit_scale
-        if self.config.vocab_size > 100_000 and self.training:
+        if use_flce_loss:
             return CausalLMOutput(logits=x, weight=self.lm_head.weight) # (b, t, vocab_size)
         else:
-            lm_logits = self.lm_head(x)
+            lm_logits = self.lm_head(x).float()
             return CausalLMOutput(logits=lm_logits) # (b, t, vocab_size)
 
     @classmethod
@@ -204,9 +347,8 @@ class GPT(nn.Module):
             dtype=torch.bfloat16,
             device=idx.device,
             base = self.config.rope_base,
-            condense_ratio=self.config.condense_ratio,
+            scaling_factor=self.config.scaling_factor,
         )
-
 
     
 class Block(nn.Module):
@@ -215,8 +357,17 @@ class Block(nn.Module):
         self.layer_idx = layer_idx
         factory_kwargs = {"jamba_norm": config.jamba_norm, "device": "cuda", "dtype": torch.float32}
 
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        
+        decouple_scaler = config.decouple_postnorm
+        self.decouple_scaler = decouple_scaler
+        if decouple_scaler:
+            self.norm_1 = RMSNormFunc(config.n_embd, eps=config.norm_eps, 
+                         decouple_gain=True, skip_gain=config.skip_gain)
+        else:
+            self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.use_skip_proj = config.skip_weight_per_layer > 0 and \
+            layer_idx % config.skip_weight_per_layer == config.skip_weight_per_layer - 1
+        if self.use_skip_proj:
+            self.skip_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # Initialize flags
         self.use_rnn = False # use rnn for this layer
         self.rnn_type = config.rnn_type  # Store the actual RNN type being used
@@ -246,7 +397,10 @@ class Block(nn.Module):
                     self.use_gmu = layer_idx % config.gmu_per_layer == 0
  
             if self.use_full:
-                config.local_window = -1
+                if config.yoco_window:
+                    config.local_window = config.block_size // 2
+                else:
+                    config.local_window = -1
 
         else: 
             if config.attn_layer_pos is not None:
@@ -256,13 +410,13 @@ class Block(nn.Module):
                 self.use_rnn = config.rnn_per_layer > 0 and layer_idx % config.rnn_per_layer == 0
                 
         ### token mixer
-        mamba2_expand = 8 * math.ceil(config.n_embd * 2 / 64 / 8) * 64 / config.n_embd
         if self.use_gmu:
             if config.gmu_attn:
                 gmu_inner = config.head_size * config.n_head
             elif config.gmu_mlp:
                 gmu_inner = config.intermediate_size
             elif config.rnn_per_layer > 0 and config.rnn_type == "mamba2":
+                mamba2_expand = 8 * math.ceil(config.n_embd * 2 / 64 / 8) * 64 / config.n_embd
                 gmu_inner = int(config.n_embd * mamba2_expand)
             elif config.rnn_per_layer > 0 and config.rnn_type == "gdn":
                 gmu_inner = math.ceil(int(config.n_embd*0.75)/256)* 256 * 2
@@ -273,30 +427,81 @@ class Block(nn.Module):
         elif self.use_rnn:
             self.attn = get_rnn(config, layer_idx, gmu_save=self.gmu_save, **factory_kwargs)
         else:
-            self.attn = CausalSelfAttention(config, n_embd= config.n_embd, layer_idx= layer_idx, yoco_cross=self.yoco_cross)
+            if config.relu2:
+                self.attn = Relu2Attention(config, n_embd= config.n_embd, layer_idx= layer_idx, )
+            else:
+                self.attn = CausalSelfAttention(config, n_embd= config.n_embd, layer_idx= layer_idx, yoco_cross=self.yoco_cross)
             
         # mlp
         if config.mlp:
-            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        if config.mlp:
-            config._mlp_class = "LLaMAMLP"
-            self.mlp = config.mlp_class(config,)
+            if decouple_scaler:
+                self.norm_2 = RMSNormFunc(config.n_embd, eps=config.norm_eps, 
+                         decouple_gain=True, skip_gain=config.skip_gain)
+            else:
+                self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+            if config.moe:
+                self.mlp = get_moe(config, is_attn=False, is_mlp=True)
+            elif config.relu2:
+                self.mlp = Relu2MLP(config, )
+            else:
+                self.mlp = LLaMAMLP(config,)
                 
         self.config = config
-        
+        if config.lc and not config.lc_shared:
+            self.layer_configurator = LayerConfigurator(config)
+            if config.mlp:
+                self.lc_mlp= LayerConfigurator(config)
+    
+    def reset_parameters(self) -> None:
+        """Initialize all parameters for this block."""
+        self.attn.reset_parameters()
+        if hasattr(self, 'skip_proj'):
+            utils.torch_default_init(self.skip_proj.weight)
+            if self.skip_proj.bias is not None:
+                nn.init.zeros_(self.skip_proj.bias)
+        if self.config.mlp:
+            self.mlp.reset_parameters()
+
     def forward(
         self,
         x: torch.Tensor,
+        input_embed: torch.Tensor,
         rope: RoPECache,
         max_seq_length: int,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
+        lc = None,
         gmu_mems = None,
+        residual_dropout: float = 0.0,
+        lc_gate_hist = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         ox = x
-        ox = ox.to(torch.float32) # reduce error accumulation across layers during inference
-        n_1 = self.norm_1(x.to(dtype=self.norm_1.weight.dtype))
+        if hasattr(self, "layer_configurator"):
+            lc = self.layer_configurator
+        if lc is not None:
+            x = lc(x)
+            if hasattr(self, "layer_configurator"):
+                lc_gate_hist.append(lc.gate)
+            else:
+                lc_gate_hist.append(lc.gate.clone())
+        # ox = x
+        if self.config.post_norm:
+            if hasattr(self.norm_1, "weight"):
+                ox = ox.to(dtype=self.norm_1.weight.dtype)
+            ox =self.norm_1(ox).bfloat16()
+            n_1 = ox
+            if self.decouple_scaler:
+                n_1 = n_1 * self.norm_1.weight
+            if self.config.skip_gain:
+                ox = ox * self.norm_1.weight1
+            if self.use_skip_proj:
+                ox = self.skip_proj(ox)
+        else:
+            ox = ox.to(torch.float32) # reduce error accumulation across layers during inference
+            if hasattr(self.norm_1, "weight"):
+                x = x.to(dtype=self.norm_1.weight.dtype)
+            n_1 = self.norm_1(x).bfloat16()
         seq_idx = None
         if self.config.use_cu_seqlen:
             if self.use_rnn and self.rnn_type == "mamba2":
@@ -332,252 +537,127 @@ class Block(nn.Module):
         else:
             # attention
             h, new_kv_cache, gmu_mems = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache, gmu_mems)
-        if self.config.mup and not self.config.original_mup:
-            h = h / math.sqrt(2 * self.config.n_layer)
-        x = ox + h
-        
+        x, h = self.post_process_residual(h, ox, lc, residual_dropout)    
+        # Log attention/RNN output RMSNorm, outlier percentage, and attention LSE
+        with torch.no_grad():
+            self.attn_output_rmsnorm = compute_rmsnorm(h)
+            self.attn_outlier_pct = compute_outlier_percentage(h)
+            self.attn_z_mean = getattr(self.attn, 'z_mean', None)
+        # if lc is not None:
+        #     x = lc.extract(x)
+        #x = (x * lc.gate )* lc.act_mask + bx * (~lc.act_mask)
         if self.config.mlp:
+            if hasattr(self, "lc_mlp"):
+                lc = self.lc_mlp
             ox = x
-            n_2 = self.norm_2(x.to(dtype=self.norm_2.weight.dtype))
-            h, gmu_mems = self.mlp(n_2, self.layer_idx,gmu_mems)
-
-            if self.config.mup and not self.config.original_mup:
-                h = h / math.sqrt(2 * self.config.n_layer)
-            x = ox + h
-        return x, new_kv_cache, gmu_mems
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config, layer_idx: int , n_embd: int, yoco_cross = False,) -> None:
-        super().__init__()
-        self.yoco_cross = yoco_cross
-        self.local = layer_idx % config.full_per_layer < config.full_per_layer-1
-            
-        self.head_size = config.head_size
-        self.n_head = config.n_head
-        self.n_query_groups = config.n_query_groups
-        if yoco_cross:
-            shape = self.head_size * self.n_head
-        else:
-            shape = (self.n_head + 2 * self.n_query_groups) * self.head_size
-
-        if config.add_sink:
-            self.k_sink = nn.Parameter(torch.zeros(self.n_query_groups * self.head_size))
-            self.v_sink = torch.zeros(self.n_query_groups * self.head_size)
-        # key, query, value projections for all heads, but in a batch
-        self.attn = nn.Linear(n_embd, shape, bias=config.attn_bias)
-        # output projection
-        self.config = config
-        self.scale = config.attn_scale if config.attn_scale is not None else 1.0 / math.sqrt(self.head_size) 
-        if self.config.mup:
-            self.scale = self.scale * math.sqrt(self.config.mup_hd0)/ math.sqrt(self.head_size) 
-        if self.local and self.config.local_window > -1:
-            self.win_tuple = (self.config.local_window-1, 0)
-        else:
-            self.win_tuple = (-1,-1)
-        self.use_cu_seqlen = config.use_cu_seqlen
-        self.use_da = config.use_da
-        if self.use_da:       
-            depth = 10000 if config.da_const_lamb else layer_idx
-            self.da = FlashDiffAttention(self.head_size, depth, causal=True, softmax_scale= self.scale, window_size = self.win_tuple)
-        else:
-            self.attn_func = FlashCrossAttention(causal=True, softmax_scale= self.scale, window_size = self.win_tuple)
-        self.proj = nn.Linear(self.head_size * self.n_head, n_embd, bias=config.attn_out_bias)
-        self.sc = config.sc_attn
-        if self.sc:
-            self.q_dim = self.n_head * self.head_size
-            self.kv_dim = self.n_query_groups * self.head_size
-            d_conv = 4
-            self.q_conv1d = nn.Conv1d(
-                in_channels=self.q_dim,
-                out_channels=self.q_dim,
-                bias=False,
-                kernel_size=d_conv,
-                groups=self.q_dim,
-                padding=d_conv - 1,
-            )
-            self.k_conv1d = nn.Conv1d(
-                in_channels=self.kv_dim,
-                out_channels=self.kv_dim,
-                bias=False,
-                kernel_size=d_conv,
-                groups=self.kv_dim,
-                padding=d_conv - 1,
-            )
-            self.v_conv1d = nn.Conv1d(
-                in_channels= self.kv_dim,
-                out_channels= self.kv_dim,
-                bias=False,
-                kernel_size=d_conv,
-                groups= self.kv_dim,
-                padding=d_conv - 1,
-            ) 
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        rope: RoPECache,
-        max_seq_length: int,
-        mask: Optional[torch.Tensor] = None,
-        input_pos: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None,
-        gmu_mems = None,
-    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-        if self.yoco_cross:
-            q = self.attn(x)
-            q = q.reshape(B,  T, -1, self.head_size) 
-            if not self.config.nope and not self.config.yoco_nope:         
-                cos, sin = rope
-                # apply rope in fp32 significanly stabalize training
-                # fused rope expect (batch_size, seqlen, nheads, headdim)
-                q = apply_rotary_emb_func(q, cos, sin, False, True)       
-             
-            k, v = kv_cache
-            y = self.scaled_dot_product_attention(q, k, v, attention_mask=mask)
-            y = y.reshape(B, T, -1)  # re-assemble all head outputs side by side
-
-            # output projection
-            y = self.proj(y)
-            return y, kv_cache, gmu_mems
-        
-        qkv = self.attn(x)
-        # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
-        q_per_kv = self.n_head // self.n_query_groups
-        total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
-        qkv = qkv.view(B, T, self.n_query_groups, total_qkv, self.head_size) # (B, T, n_query_groups, total_qkv, hs)
-        # qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
-
-        # split batched computation into three
-        q, k, v = qkv.split((q_per_kv, 1, 1), dim=-2)
-        q = q.reshape(B,  T, -1 )  # (B, T, nh_q, hs)
-        k = k.reshape(B,  T, -1 )  
-        v = v.reshape(B,  T, -1 )  
-        if self.sc:
-            q = causal_conv1d_fn(
-                        x = q.transpose(-1,-2),
-                        weight=rearrange(self.q_conv1d.weight, "d 1 w -> d w"),
-                        bias=self.q_conv1d.bias,
-                        activation="silu",
-                    ).transpose(-1,-2)
-            k = causal_conv1d_fn(
-                        x = k.transpose(-1,-2),
-                        weight=rearrange(self.k_conv1d.weight, "d 1 w -> d w"),
-                        bias=self.k_conv1d.bias,
-                        activation="silu",
-                    ).transpose(-1,-2)
-            v = causal_conv1d_fn(
-                        x = v.transpose(-1,-2),
-                        weight=rearrange(self.v_conv1d.weight, "d 1 w -> d w"),
-                        bias=self.v_conv1d.bias,
-                        activation="silu",
-                    ).transpose(-1,-2) 
-
-        q = q.reshape(B,  T, -1, self.head_size)  # (B, T, nh_q, hs)
-        k = k.reshape(B,  T, -1, self.head_size)  
-        v = v.reshape(B,  T, -1, self.head_size)
-
-        if not self.config.nope and not (self.config.yoco_nope and self.win_tuple == (-1,-1)):         
-            cos, sin = rope
-            # apply rope in fp32 significanly stabalize training
-            # fused rope expect (batch_size, seqlen, nheads, headdim)
-            q = apply_rotary_emb_func(q, cos, sin, False, True)
-            k = apply_rotary_emb_func(k, cos, sin, False, True)
-
-        if self.config.add_sink:
-            k = torch.cat([self.k_sink.to(k).reshape(1,  1, -1, self.head_size).repeat(B,1,1,1), k], dim=1)
-            v = torch.cat([self.v_sink.to(v).reshape(1,  1, -1, self.head_size).repeat(B,1,1,1), v], dim=1)
-        kv_cache = k, v
-
-        y = self.scaled_dot_product_attention(q, k, v, attention_mask=mask)
-
-        y = y.reshape(B, T, -1)  # re-assemble all head outputs side by side
-        if self.config.gmu_attn:
-            gmu_mems = y
-        # output projection
-        y = self.proj(y)
-        return y, kv_cache, gmu_mems
-
-    def scaled_dot_product_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
-    ):
-        
-        batch_size, seqlen_q = q.shape[0], q.shape[1]
-        seqlen_k = k.shape[1]
-        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k = None, None, None, None
-        if not self.use_da:
-            kv = torch.stack([k, v], dim=2)
-        if attention_mask is not None:
-            if self.use_cu_seqlen:
-                if self.use_da:
-                    k = k.reshape(-1, k.shape[-2], k.shape[-1])
-                    v = v.reshape(-1, v.shape[-2], v.shape[-1])
+            if lc is not None:
+                x = lc(x)
+                if hasattr(self, "lc_mlp"):
+                    lc_gate_hist.append(lc.gate)
                 else:
-                    ckv = kv.reshape(-1, kv.shape[-3], kv.shape[-2], kv.shape[-1])
-                cu_seqlens_k = cu_seqlens_q = attention_mask.int()
-                max_seqlen_q = max_seqlen_k = (attention_mask - attention_mask.roll(1)).max().cpu().item()
-                q = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    lc_gate_hist.append(lc.gate.clone())
+            if self.config.post_norm:
+                if hasattr(self.norm_2, "weight"):
+                    ox = ox.to(dtype=self.norm_2.weight.dtype)  
+                ox =self.norm_2(ox).bfloat16()
+                n_2 = ox
+                if self.decouple_scaler:
+                    n_2 = n_2 * self.norm_2.weight
+                if self.config.skip_gain:
+                    ox = ox * self.norm_2.weight1
             else:
-                if self.use_da:
-                    k, _, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k, attention_mask.to(k.device))
-                    v, _, _, _, _ = unpad_input(v, attention_mask.to(v.device))
-                else:
-                    ckv, _, cu_seqlens_k, max_seqlen_k, _ = unpad_input(kv, attention_mask.to(kv.device))
+                ox = ox.to(torch.float32) # reduce error accumulation across layers during inference
+                if hasattr(self.norm_2, "weight"):
+                    x = x.to(dtype=self.norm_2.weight.dtype)
+                n_2 = self.norm_2(x).bfloat16()
+            if self.config.moe:
+                h = self.mlp(n_2)
+            else:
+                h, gmu_mems = self.mlp(n_2, self.layer_idx,gmu_mems)
+            x, h = self.post_process_residual(h, ox, lc, residual_dropout)
+            # Log MLP/MoE output RMSNorm, outlier percentage, and router LSE
+            with torch.no_grad():
+                self.mlp_output_rmsnorm = compute_rmsnorm(h)
+                self.mlp_outlier_pct = compute_outlier_percentage(h)
+                self.router_z_mean = getattr(self.mlp, 'router_z_mean', None)
+            # if lc is not None:
+            #     x = lc.extract(x)
+            #x = (x * lc.gate)* lc.act_mask + bx * (~lc.act_mask)
+            #x = x * lc.gate * lc.act_mask + ox * (~lc.act_mask)  
+        return x, new_kv_cache, gmu_mems, input_embed
 
-                if seqlen_q == 1:
-                    attention_mask = torch.ones(batch_size, 1, device=q.device)
-                elif seqlen_q != seqlen_k:
-                    attention_mask = attention_mask[:, -seqlen_q:]
-
-                q, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q, attention_mask.to(q.device))
+    def post_process_residual(self, h, ox, lc, residual_dropout: float = 0.0) -> torch.Tensor:
+        if lc is not None:
+            h = lc.extract(h) * torch.sqrt((2 * lc.gate - 1) * lc.act_mask + 1e-5)
+            #h = lc.extract(h) * lc.gate * lc.act_mask / math.sqrt(2 * self.config.n_layer / self.config.sparsity)
+        elif self.config.depth_scale:
+            h = h / math.sqrt(2 * self.config.n_layer)
+        if self.training and residual_dropout > 0:
+            h = F.dropout(h, p=residual_dropout, training=True)
+        if self.config.no_skip:
+            x = h
+        elif self.config.sum_skip:
+            x = h
+            input_embed = input_embed.to(torch.float32) # reduce error accumulation across layers during inference
+            input_embed = input_embed + h.to(torch.float32)
         else:
-            if not self.use_da:
-                ckv = kv
+            x = ox + h
+        return x, h
 
-        if self.config.full_swa_extend and self.win_tuple == (-1,-1) and not self.training:
-            wintuple = (self.config.block_size -1, 0)
-            if self.use_da:
-                self.da.window_size = wintuple
-            else:   
-                self.attn_func.window_size = wintuple
-        if self.use_da:
-            attn_output =self.da(q, k, v, cu_seqlens=cu_seqlens_q, max_seqlen=max_seqlen_q, 
-                                    cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max_seqlen_k,)
-        else:
-            attn_output =self.attn_func(q, ckv, cu_seqlens=cu_seqlens_q, max_seqlen=max_seqlen_q, 
-                                    cu_seqlens_k=cu_seqlens_k, max_seqlen_k=max_seqlen_k,)
-        if self.use_cu_seqlen:
-            attn_output = attn_output.reshape(batch_size, seqlen_q, q.shape[-2], q.shape[-1])
-        else:
-            attn_output = (
-                pad_input(attn_output, indices_q, batch_size, max_seqlen_q)
-                if attention_mask is not None
-                else attn_output
-            )
-        return attn_output
+# GPT-OSS SwiGLU
+@torch.compile
+def oss_swiglu(x_glu: torch.Tensor, x_linear: torch.Tensor, 
+            alpha: float = 1.702, limit: float = 7.0) -> torch.Tensor:
+    # chunk is faster than interleave on torch
+    # # x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    # Clamp the input values
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note we add an extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1)
 
-    
 class LLaMAMLP(nn.Module):
     def __init__(self, config: Config,) -> None:
         super().__init__()
         self.relu2 = config.mlp_relu2
         self.config = config
         self.legacy_swiglu = False
+        self.oss_swiglu = config.oss_swiglu
         if self.relu2:
-            self.w1 = nn.Linear(config.n_embd, int(config.intermediate_size*1.5), bias=config.bias)
-            self.w3 = nn.Linear(int(config.intermediate_size*1.5), config.n_embd, bias=config.bias)
+            in_size = int(config.intermediate_size*1.5)
+            out_size = int(config.intermediate_size*1.5)
         else:
-            if self.legacy_swiglu:
-                self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False)
-            else:
-                self.w1 = nn.Linear(config.n_embd, int(config.intermediate_size*2), bias=config.bias)
-                self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+            in_size = int(config.intermediate_size*2)
+            out_size = config.intermediate_size
+        if self.legacy_swiglu:
+            self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False)
+        else:
+            self.w1 = nn.Linear(config.n_embd, in_size, bias=config.bias)
+            self.w3 = nn.Linear(out_size, config.n_embd, bias=config.bias)
+            if self.config.ffn_norm:
+                self.norm = config.norm_class(out_size, eps=config.norm_eps)
 
+    def reset_parameters(self) -> None:
+        """Initialize MLP parameters using PyTorch default initialization."""
+        if hasattr(self, 'w1'):
+            utils.torch_default_init(self.w1.weight)
+            if self.w1.bias is not None:
+                nn.init.zeros_(self.w1.bias)
+        if hasattr(self, 'w3'):
+            utils.torch_default_init(self.w3.weight)
+            if self.w3.bias is not None:
+                nn.init.zeros_(self.w3.bias)
+        if hasattr(self, 'swiglu') and self.legacy_swiglu:
+            self.swiglu.reset_parameters()
 
+    @torch.compile
     def forward(self, x: torch.Tensor, layer_idx: int, gmu_mems: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.relu2:
             x = self.w1(x)
             x = F.relu(x).square()
+            if self.config.ffn_norm:
+                x = self.norm(x)
             x = self.w3(x)
         else:
             # SwiGLU implementation: split input into two parts, apply SwiGLU activation
@@ -587,7 +667,12 @@ class LLaMAMLP(nn.Module):
                 x_gate, x_inp = self.w1(x).chunk(2, dim=-1)
                 if self.config.gmu_mlp and layer_idx == self.config.n_layer//2+1:
                     gmu_mems = x_inp
-                x = swiglu(x_gate, x_inp)
+                if self.oss_swiglu:
+                    x = oss_swiglu(x_gate, x_inp)
+                else:   
+                    x = swiglu(x_gate, x_inp)
+                if self.config.ffn_norm:
+                    x = self.norm(x)
                 x = self.w3(x)
         return x, gmu_mems
 
@@ -603,6 +688,13 @@ class SwiGLU(nn.Module):
         # else:
         #     self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=config.bias, _pack_weights=False)
 
+    def reset_parameters(self) -> None:
+        """Initialize SwiGLU parameters using PyTorch default initialization."""
+        for linear in [self.w1, self.w2, self.w3]:
+            utils.torch_default_init(linear.weight)
+            if linear.bias is not None:
+                nn.init.zeros_(linear.bias)
+
     def forward(self, x):
         x1 = self.w1(x)
         x2 = self.w2(x)
@@ -610,34 +702,7 @@ class SwiGLU(nn.Module):
         x = self.w3(x)
         return x
 
-    
-def build_rope_cache(
-    seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000, condense_ratio: int = 1
-) -> RoPECache:
-    """Enhanced Transformer with Rotary Position Embedding.
 
-    Derived from: https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/
-    transformers/rope/__init__.py. MIT License:
-    https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/license.
-    """
-    # $\Theta = {\theta_i = 10000^{\frac{2(i-1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
-    theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, device=device) / n_elem))
-
-    # Create position indexes `[0, 1, ..., seq_len - 1]`
-    seq_idx = torch.arange(seq_len, device=device) / condense_ratio
-
-    # Calculate the product of position index and $\theta_i$
-    idx_theta = torch.outer(seq_idx, theta)
-
-    cos, sin = torch.cos(idx_theta), torch.sin(idx_theta)
-
-    # added by peiyuan to ensure same data type with q, k, to use fused rotary embedding
-    if dtype == torch.bfloat16:
-        return cos.bfloat16(), sin.bfloat16()
-    # this is to mimic the behaviour of complex32, else we will get different results
-    if dtype in (torch.float16, torch.bfloat16, torch.int8):
-        return cos.half(), sin.half()
-    return cos, sin
 
 
     

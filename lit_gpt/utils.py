@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.utils._device
 from lightning.fabric.loggers import CSVLogger
 from torch.serialization import normalize_storage_type
+import math
 
 
 def find_multiple(n: int, k: int) -> int:
