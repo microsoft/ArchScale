@@ -17,6 +17,7 @@ import datasets
 from lm_eval.models.utils import stop_sequences_criteria
 import re
 import torch.nn.functional as F
+from utils import _ensure_local_path
 
 datasets.builder.has_sufficient_disk_space = lambda needed_bytes, directory='.': True
 
@@ -110,21 +111,29 @@ class ModelWrapper(torch.nn.Module):
         return sequences
 
 def load_model(checkpoint_path, config, device, dtype):
+    # todo: unify name parsing with pretrain.py
     config = Config.from_name(config)
+    config.mup= "_mup_" in checkpoint_path
+    model_class = GPT
+    config.tied_embed= "_tie" in checkpoint_path
+    config.rope_base = 640000 if "_rbase_" in checkpoint_path else 10000
     m = re.search(r"_swa(\d+)", checkpoint_path)
     if m:
         swa_size = int(m.group(1)) 
         print(f"{swa_size=}") 
         config.local_window = swa_size 
-    config.mup= "_mup_" in checkpoint_path
-    config.tied_embed= "_tie" in checkpoint_path
-    config.rope_base = 640000 if "_rbase_" in checkpoint_path else 10000
     m = re.search(r"_ctx(\d+)", checkpoint_path)
     if m:
         ctx_size = int(m.group(1)) 
         print(f"{ctx_size=}") 
-        config.block_size=ctx_size
-    model = GPT(config)
+        config.block_size = ctx_size
+        if config.yoco_window:
+            config.scaling_factor =  ctx_size / 8192
+        else:
+            config.scaling_factor =  ctx_size / 4096   
+            
+    model = model_class(config)
+    checkpoint_path = _ensure_local_path(checkpoint_path, concurrency=128)
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     model.load_state_dict(checkpoint["model"])
     model.to(device=device, dtype=dtype)
@@ -153,7 +162,6 @@ class ArchScaleEvalWrapper(HFLM):
         subfolder: str = "",
     ) -> None:
         self._config = None
-      
   
     def _create_model(
         self,

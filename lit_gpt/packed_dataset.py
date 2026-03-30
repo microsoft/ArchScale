@@ -15,6 +15,10 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
+import blobfile as bf
+
+from utils import _parallel_ensure_local_paths
+
 
 dtypes = {1: np.uint8, 2: np.int8, 3: np.int16, 4: np.int32, 5: np.int64, 6: np.float32, 7: np.float64, 8: np.uint16}
 
@@ -88,34 +92,34 @@ class PackedDatasetBuilder(object):
         self._tokens = 0
     
     def _load_ckpt(self):
-        ckptname = f"{self._prefix}.ckpt"
-        ckptname = os.path.join(self._outdir, ckptname)
-        if os.path.exists(ckptname):
-            with open(ckptname, "r") as f:
+        ckptname = os.path.join(self._outdir, f"{self._prefix}.ckpt")
+        if bf.exists(ckptname):
+            with bf.BlobFile(ckptname, "r") as f:
                 data = json.load(f)
                 self._counter = data["counter"] + 1
                 self._tokens = data["tokens"]
                 self._total_samples = data["samples"]
-            print(f"Loaded checkpoint from {ckptname}, counter={self._counter}, tokens={self._tokens}, samples={self._total_samples}")
+            print(
+                f"Loaded checkpoint from {ckptname}, counter={self._counter}, "
+                f"tokens={self._tokens}, samples={self._total_samples}"
+            )
             return True
         else:
             print(f"Checkpoint {ckptname} not found, starting fresh.")
             return False
 
     def _write_chunk(self):
-        filename = f"{self._prefix}_{self._counter:010d}.bin"
-        filename = os.path.join(self._outdir, filename)
-        ckptname = f"{self._prefix}.ckpt"
-        ckptname = os.path.join(self._outdir, ckptname)
+        filename = os.path.join(self._outdir, f"{self._prefix}_{self._counter:010d}.bin")
+        ckptname = os.path.join(self._outdir, f"{self._prefix}.ckpt")
 
-        with open(filename, "wb") as f:
+        with bf.BlobFile(filename, "wb") as f:
             f.write(HDR_MAGIC)
             f.write(struct.pack("<Q", self._version))
             f.write(struct.pack("<B", code(self._dtype)))
             f.write(struct.pack("<Q", self._chunk_size))
             f.write(self._arr.tobytes(order="C"))
-        
-        with open(ckptname, "w") as f:
+
+        with bf.BlobFile(ckptname, "w") as f:
             json.dump({"counter": self._counter, "tokens": self._tokens, "samples": self._total_samples}, f)
 
         self._filenames.append(filename)
@@ -170,7 +174,7 @@ class PackedDatasetIterator:
         self._dtype = None
         self._block_size = block_size
         self._n_blocks = None
-
+        
         self._mmaps = []
         self._buffers = []
 
@@ -194,9 +198,9 @@ class PackedDatasetIterator:
         for mmap in self._mmaps:
             mmap._mmap.close()
 
-    def _load_n_chunks(self):
+    def _load_n_chunks(self): 
         self._close_mmaps()
-        self._mmaps = []
+        self._mmaps = [] 
         self._buffers = []
 
         if len(self._filenames) == 0:
@@ -220,15 +224,18 @@ class PackedDatasetIterator:
                 n_chunks = len(self._filenames[self._file_idx :])
             else:
                 n_chunks = self._n_chunks
-                
-        for i in range(n_chunks):
-            #print(self._file_idx,i,len(self._filenames))
-            filename = self._filenames[self._file_idx + i]
-            if self._dtype is None:
-                self._dtype, self._chunk_size = self._read_header(filename)
-                self._n_blocks = self._chunk_size // self._block_size
-            # TODO: check header matches with previous files
-            mmap = np.memmap(filename, mode="r", order="C", offset=HDR_SIZE)
+        # Fetch/copy all files for this batch in parallel
+        batch_filenames = [self._filenames[self._file_idx + i] for i in range(n_chunks)]
+        local_paths = _parallel_ensure_local_paths(batch_filenames, max_workers=n_chunks)
+
+        print(f"Loaded {len(local_paths)} local paths")
+        # Initialize header info from the first file if needed
+        if self._dtype is None and local_paths:
+            self._dtype, self._chunk_size = self._read_header(local_paths[0])
+            self._n_blocks = self._chunk_size // self._block_size
+
+        for local_path in local_paths:
+            mmap = np.memmap(local_path, mode="r", order="C", offset=HDR_SIZE)
             self._mmaps.append(mmap)
             self._buffers.append(memoryview(mmap))
 
@@ -276,10 +283,18 @@ class CombinedDataset(IterableDataset):
 
 class CombinedDatasetIterator:
     def __init__(self, datasets, seed, weights):
-        self._datasets = [iter(el) for el in datasets]
+        # Build paired list of (iterator, is_code_coda_flag) based on dataset source name
+        self._datasets = []
+        for ds in datasets:
+            it = iter(ds)
+            is_code = "msr_code" in ds._filenames[0]
+            self._datasets.append((it, is_code))
         self._weights = weights
         self._rng = random.Random(seed)
 
     def __next__(self):
-        (dataset,) = self._rng.choices(self._datasets, weights=self._weights, k=1)
-        return next(dataset)
+        # pick which dataset to draw from
+        idx = self._rng.choices(range(len(self._datasets)), weights=self._weights, k=1)[0]
+        dataset_it, is_code = self._datasets[idx]
+        sample = next(dataset_it)
+        return sample, is_code

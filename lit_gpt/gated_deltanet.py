@@ -19,6 +19,7 @@ from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from .gated_memory_unit import swiglu
+import utils
 # use mamba_ssm's RMSNormGated so torch.compile can work
 from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated 
 
@@ -153,20 +154,12 @@ class GatedDeltaNet(nn.Module):
         self.a_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
         self.b_proj = nn.Linear(hidden_size, self.num_v_heads, bias=False)
 
-        A = torch.empty(self.num_v_heads, dtype=torch.float32).uniform_(0, 16)
-        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log = nn.Parameter(torch.empty(self.num_v_heads, dtype=torch.float32))
         # hard coded for now
-        dt_min = 0.001
-        dt_max = 0.1
-        dt_init_floor = 1e-4
-        dt = torch.exp(
-            torch.rand(self.num_v_heads) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        )
-        dt = torch.clamp(dt, min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        self.dt_bias = nn.Parameter(inv_dt)
+        self.dt_min = 0.001
+        self.dt_max = 0.1
+        self.dt_init_floor = 1e-4
+        self.dt_bias = nn.Parameter(torch.empty(self.num_v_heads))
 
         if use_short_conv:
             self.conv_size = conv_size
@@ -200,6 +193,47 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(self.value_dim, eps = norm_eps, norm_before_gate = False) 
         
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        """Initialize GatedDeltaNet parameters."""
+        
+        # Initialize linear projections
+        for proj in [self.q_proj, self.k_proj, self.v_proj, self.a_proj, self.b_proj, self.o_proj]:
+            utils.torch_default_init(proj.weight)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
+        
+        # Initialize gate projection if present
+        if self.use_gate:
+            utils.torch_default_init(self.g_proj.weight)
+            if self.g_proj.bias is not None:
+                nn.init.zeros_(self.g_proj.bias)
+        
+        # Initialize short convolutions if present
+        if self.use_short_conv:
+            for conv in [self.q_conv1d, self.k_conv1d, self.v_conv1d]:
+                if hasattr(conv, 'reset_parameters'):
+                    conv.reset_parameters()
+        
+        # Initialize A_log: uniform(0, 16) then log
+        A = torch.empty(self.num_v_heads, dtype=torch.float32, device=self.A_log.device).uniform_(0, 16)
+        self.A_log.copy_(torch.log(A))
+        
+        # Initialize dt_bias so that F.softplus(dt_bias) is between dt_min and dt_max
+        dt = torch.exp(
+            torch.rand(self.num_v_heads, device=self.dt_bias.device, dtype=torch.float32) 
+            * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        )
+        dt = torch.clamp(dt, min=self.dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias.copy_(inv_dt.to(dtype=self.dt_bias.dtype))
+        
+        # Initialize norm
+        if hasattr(self.norm, 'reset_parameters'):
+            self.norm.reset_parameters()
         
     def forward(
         self,

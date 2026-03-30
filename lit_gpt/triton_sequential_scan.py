@@ -8,14 +8,22 @@ import triton.language as tl
 
 assert triton.__version__ != '2.1.0', 'Triton 2.1.0 is missing enable_fp_fusion. Triton 2.2.0 is required for numerical stability of this implementation.'
 
-inv_ln2 = 1.44269504
+inv_ln2 = tl.constexpr(1.44269504089)# for exp2
 
 # credit: https://github.com/proger/accelerated-scan/blob/b9edbad65c673f9a1915efe51dc6bbf50fd7f8c4/accelerated_scan/triton.py
 
-@torch.jit.script 
 def reduce(H, C):
-    return (H * C.unsqueeze(-2)).sum(-1)
+    out = H @ C.unsqueeze(-1)
+    return out.squeeze(-1)
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [1, 2, 3, 4]
+    ],
+    key=['D', 'K'],
+)
 @triton.jit
 def fwd_recurrence(
     A,
@@ -58,7 +66,7 @@ def fwd_recurrence(
         u = tl.load(u_ptr)
         x_dt = u * dt
         x_dt_b = x_dt[:, None] * b[None, :]
-        dt_a = tl.exp(dt[:, None] * _A)
+        dt_a = tl.exp2(dt[:, None] * _A * inv_ln2)
         h = h * dt_a + x_dt_b
         tl.store(H_ptr, h)
 
@@ -68,7 +76,14 @@ def fwd_recurrence(
         o_ptr += D
         H_ptr += D * K
 
-
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [1, 2, 3, 4]
+    ],
+    key=['D', 'K'],
+)
 @triton.jit
 def bwd_recurrence(
     A,
@@ -142,7 +157,7 @@ def bwd_recurrence(
         tl.store(du_ptr, du)
 
         # gradient wrt decay
-        dt_a = tl.exp(dt[:, None] * _A)
+        dt_a = tl.exp2(dt[:, None] * _A * inv_ln2)
         dh *= dt_a
 
         d_decay = dh * next_h
@@ -180,11 +195,9 @@ class SelectiveScan(torch.autograd.Function):
         ctx.d = d
         ctx.K = K
         BV = 64
-        num_warps = 4
 
         if b_size <= 16:
             BV = 32 
-            num_warps = 2
         
         NV = triton.cdiv(d, BV)
 
@@ -196,7 +209,7 @@ class SelectiveScan(torch.autograd.Function):
                 b_size, d, K, device=u.device, dtype=torch.float32)
 
         fwd_recurrence[(b_size, NV)](A, B, C, delta, u, o, H,
-                                     initial_state,  T, d, K, BV,  num_warps=num_warps, num_stages=1)
+                                     initial_state,  T, d, K, BV)
         o = reduce(H, C)
         ctx.save_for_backward(A, B, C, delta, H, u)
         ctx.initial_state = initial_state
@@ -212,11 +225,9 @@ class SelectiveScan(torch.autograd.Function):
         K = ctx.K
 
         BV = 64
-        num_warps = 4
 
         if b_size <= 16:
             BV = 32
-            num_warps = 2
 
         NV = triton.cdiv(d, BV)
         dA = A.new_empty(b_size, d, K)
@@ -226,7 +237,7 @@ class SelectiveScan(torch.autograd.Function):
         dc = C.new_empty(NV, b_size, T, K)
 
         bwd_recurrence[(b_size, NV)](A, B, C, u, delta, do, H, dA, db, dc,
-                                     d_delta, du, b_size, ctx.initial_state, T, d, K, BV, num_warps=num_warps)
+                                     d_delta, du, b_size, ctx.initial_state, T, d, K, BV)
         db = db.sum(0)
         dc = dc.sum(0)
 
@@ -239,7 +250,7 @@ def triton_selective_scan_sequential(u, delta, A, B, C, D, initial_state=None):
     A = A.float()
     if initial_state is not None:
         initial_state = initial_state.detach()
-    o, final_state = SelectiveScan.apply(u, delta, A, B, C, initial_state)
+    o, final_state = SelectiveScan.apply(u, delta, A, B, C.float(), initial_state)
     o = o + D * u
     return o.to(original_dtype), final_state
 

@@ -21,6 +21,15 @@ from lit_gpt.utils import num_parameters
 GPU_AVAILABLE_FLOPS = {
     # source: https://resources.nvidia.com/en-us-tensor-core/nvidia-tensor-core-gpu-datasheet
     # nvidia publishes spec sheet with a 2x sparsity factor
+    "gb200":{
+        "bf16-mixed": 2.5e15,
+    },
+    "b200":{
+        "bf16-mixed": 2.25e15,
+    },
+    "b100":{
+        "bf16-mixed": 1.8e15,
+    },
     "h100-sxm": {
         "64-true": 67e12,
         "32-true": 67e12,
@@ -80,7 +89,13 @@ TPU_AVAILABLE_FLOPS = {
 def get_flops_available(device: torch.device, precision: str) -> Optional[float]:
     if device.type == "cuda":
         device_name = torch.cuda.get_device_name(device).lower()
-        if "h100" in device_name and "hbm3" in device_name:
+        if "gb200" in device_name or "grace blackwell" in device_name:
+            device_name = "gb200"
+        elif "b200" in device_name:
+            device_name = "b200"
+        elif "b100" in device_name:
+            device_name = "b100"
+        elif "h100" in device_name and "hbm3" in device_name:
             device_name = "h100-sxm"
         elif "h100" in device_name and ("pcie" in device_name or "hbm2e" in device_name):
             device_name = "h100-pcie"
@@ -236,9 +251,6 @@ class SpeedMonitorBase:
     ):
         self.iter += 1
         metrics = {}
-        if hasattr(model, "layer_configurator") and model.layer_configurator is not None:
-            spar = (model.layer_configurator.gate==0).float().mean().item()
-            self.history_train_sparsity.append(spar)
         self.history_samples.append(samples)
         self.history_training_loss.append(train_loss)
         if lengths is not None:
@@ -270,13 +282,6 @@ class SpeedMonitorBase:
                         "total_tokens": avg_length * world_size * samples,
                     }
                 )
-                if hasattr(model, "layer_configurator") and model.layer_configurator is not None:
-                    avg_spar = sum(self.history_train_sparsity) / len(self.history_train_sparsity)
-                    metrics.update(
-                        {
-                            "metric/train_sparsity": avg_spar,
-                        }
-                    )
                 if train_loss is not None:
                     avg_loss = sum(self.history_training_loss) / len(self.history_training_loss)
                     metrics.update(
@@ -318,7 +323,7 @@ class SpeedMonitorBase:
 class SpeedMonitorFabric(SpeedMonitorBase):
     def __init__(self, fabric: Fabric, *args: Any, **kwargs: Any) -> None:
         # TODO: this will not work properly if a precision plugin is passed to Fabric
-        flops_available = get_flops_available(fabric.device, fabric._connector._precision_input)
+        flops_available = get_flops_available(fabric.device, "bf16-mixed")
         super().__init__(flops_available, fabric.log_dict, *args, **kwargs)
 
     @fabric_rank_zero_only
@@ -342,7 +347,7 @@ class SpeedMonitorCallback(Callback):
             return  # already setup
         # TODO: this will not work properly if a precision plugin is passed to Trainer
         flops_available = get_flops_available(
-            trainer.strategy.root_device, trainer._accelerator_connector._precision_flag
+            trainer.strategy.root_device, "bf16-mixed"
         )
         self.speed_monitor = SpeedMonitorBase(flops_available, trainer.logger.log_metrics, **self.speed_monitor_kwargs)
 
@@ -389,26 +394,40 @@ def flops_per_param(config: Config, n_params: int) -> int:
     # this assumes that all samples have a fixed length equal to the block size
     # which is most likely false during finetuning
     flops_per_seq = flops_per_token * config.block_size
-    attn_flops_per_seq = config.n_layer * 2 * 2 * (config.n_embd * (config.block_size**2))
+    if config.local_window is not None and config.local_window > 0:
+        ctx_flops_per_seq = config.block_size * config.local_window
+    else:
+        ctx_flops_per_seq = config.block_size**2
+    attn_flops_per_seq = config.n_layer * 2 * 2 * (config.n_head * config.head_size * ctx_flops_per_seq)
     return flops_per_seq + attn_flops_per_seq
 
 
-def estimate_flops(model: GPT) -> int:
+def estimate_flops(model: GPT, n_params: int = None) -> int:
     """Measures estimated FLOPs for MFU.
 
     Refs:
         * https://ar5iv.labs.arxiv.org/html/2205.05198#A1
         * https://ar5iv.labs.arxiv.org/html/2204.02311#A2
+    
+    Args:
+        model: The GPT model instance.
+        n_params: Optional parameter count from get_parameters_count() for more accurate
+                  architecture-specific FLOPs estimation. If not provided, falls back to
+                  counting actual model parameters (which may overestimate FLOPs).
     """
-    # using all parameters for this is a naive over estimation because not all model parameters actually contribute to
-    # this FLOP computation (e.g. embedding, norm). For this reason, the result will be higher by a fixed percentage
-    # (~10%) compared to the measured FLOPs, making those lower but more realistic.
-    # For a proper estimate, this needs a more fine-grained calculation as in Appendix A of the paper.
-    n_trainable_params = num_parameters(model, requires_grad=True)
+    # If n_params is provided (from get_parameters_count), use it for more accurate estimation.
+    # Otherwise, fall back to counting actual model parameters (naive over estimation because 
+    # not all model parameters actually contribute to FLOP computation, e.g. embedding, norm).
+    if n_params is not None:
+        n_trainable_params = n_params
+        n_frozen_params = 0
+    else:
+        n_trainable_params = num_parameters(model, requires_grad=True)
+        n_frozen_params = num_parameters(model, requires_grad=False)
+    
     trainable_flops = flops_per_param(model.config, n_trainable_params)
     # forward + backward + gradients (assumes no gradient accumulation)
     ops_per_step = 3 if model.training else 1
-    n_frozen_params = num_parameters(model, requires_grad=False)
     frozen_flops = flops_per_param(model.config, n_frozen_params)
     # forward + backward
     frozen_ops_per_step = 2 if model.training else 1

@@ -1,10 +1,15 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
+import math
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from .ops.layernorm_gated import RMSNorm as RMSNormGated
+
+import utils
 
 swiglu_fwd_codestring = """
 template <typename T> T swiglu_fwd(T x, T y) {
@@ -36,6 +41,38 @@ class SwiGLUFunction(torch.autograd.Function):
  
 swiglu = SwiGLUFunction.apply
 
+
+glu_fwd_codestring = """
+template <typename T> T glu_fwd(T x, T y) {
+    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
+    return x_sigmoid * float(y);
+}
+"""
+glu_bwd_codestring = """
+template <typename T> T glu_bwd(T x, T y, T g, T& dx, T& dy) {
+    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
+    dx = x_sigmoid * (1.0f - x_sigmoid) * float(y) * float(g);
+    dy = x_sigmoid * float(g);
+}
+"""
+glu_fwd = torch.cuda.jiterator._create_jit_fn(glu_fwd_codestring)
+glu_bwd = torch.cuda.jiterator._create_multi_output_jit_fn(glu_bwd_codestring, num_outputs=2)
+
+
+class GLUFunction(torch.autograd.Function):
+    # return sigmoid(x) * y
+    @staticmethod
+    def forward(ctx, x, y):
+        ctx.save_for_backward(x, y)
+        return glu_fwd(x, y)
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, y = ctx.saved_tensors
+        return glu_bwd(x, y, dout)
+
+glu = GLUFunction.apply
+
 class GMU(nn.Module):
     def __init__(
         self,
@@ -53,6 +90,19 @@ class GMU(nn.Module):
         if use_norm:
             self.norm = RMSNormGated(d_mem, eps = 1e-5, norm_before_gate = False, group_size = d_mem // ngroups)
         self.use_norm = use_norm
+    
+    def reset_parameters(self) -> None:
+        """Initialize GMU parameters using PyTorch default initialization."""
+        utils.torch_default_init(self.in_proj.weight)
+        if self.in_proj.bias is not None:
+            nn.init.zeros_(self.in_proj.bias)
+        
+        utils.torch_default_init(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+        
+        if self.use_norm and hasattr(self.norm, 'reset_parameters'):
+            self.norm.reset_parameters()
         
     def forward(self, hidden_states, memory):
         out = self.in_proj(hidden_states)
@@ -67,6 +117,10 @@ class GMUWrapper(nn.Module):
     def __init__(self, d_model, d_mem, bias = False, use_norm = False, ngroups = 1, device = None, dtype = None):
         super().__init__()
         self.gmu = GMU(d_model, d_mem, bias, use_norm, ngroups, device, dtype)
+    
+    def reset_parameters(self) -> None:
+        """Initialize GMUWrapper parameters."""
+        self.gmu.reset_parameters()
         
     def forward(self, hidden_states, memory):
         return self.gmu(hidden_states, memory), memory

@@ -5,6 +5,7 @@
 
 import math
 from typing import Optional
+from functools import partial
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from einops import rearrange, repeat
+
+import utils
 
 
 
@@ -56,6 +59,9 @@ class Mamba(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.d_model = d_model
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.dt_init_floor = dt_init_floor
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
@@ -71,15 +77,19 @@ class Mamba(nn.Module):
             
         self.gmu_save = gmu_save
         self.use_cu_seqlen = False
-        if config is not None and config.use_cu_seqlen:
-            self.use_cu_seqlen = True
-            from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as ssf_custom, mamba_inner_fn as mb_custom
-            self.selective_scan_fn =  ssf_custom
-            self.mamba_inner_fn =  mb_custom
+        self.use_triton = False  # TODO: Hard code True for GB200
+        if self.use_triton:
+            self.use_fast_path = False
         else:
-            from .selective_scan_interface import selective_scan_fn, mamba_inner_fn
-            self.selective_scan_fn =  selective_scan_fn
-            self.mamba_inner_fn =  mamba_inner_fn
+            if config is not None and config.use_cu_seqlen:
+                self.use_cu_seqlen = True
+                from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as ssf_custom, mamba_inner_fn as mb_custom
+                self.selective_scan_fn =  ssf_custom
+                self.mamba_inner_fn =  mb_custom
+            else:
+                from .selective_scan_interface import selective_scan_fn, mamba_inner_fn
+                self.selective_scan_fn =  selective_scan_fn
+                self.mamba_inner_fn =  mamba_inner_fn
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
@@ -100,41 +110,77 @@ class Mamba(nn.Module):
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+        self.dt_init = dt_init
+        self.dt_scale = dt_scale
 
+        self.A_log = nn.Parameter(torch.ones(self.d_inner, self.d_state, dtype=torch.float32, device=device))
+
+        # D "skip" parameter
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
+
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        """Initialize Mamba parameters."""
+        # Initialize linear layers with PyTorch default
+        utils.torch_default_init(self.in_proj.weight)
+        if self.in_proj.bias is not None:
+            nn.init.zeros_(self.in_proj.bias)
+        
+        # Initialize conv1d
+        utils.torch_default_init(self.conv1d.weight)
+        if self.conv1d.bias is not None:
+            nn.init.zeros_(self.conv1d.bias)
+        
+        # Initialize x_proj (no bias)
+        utils.torch_default_init(self.x_proj.weight)
+        
         # Initialize special dt projection to preserve variance at initialization
-        dt_init_std = self.dt_rank**-0.5 * dt_scale
-        if dt_init == "constant":
+        dt_init_std = self.dt_rank**-0.5 * self.dt_scale
+        if self.dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
+        elif self.dt_init == "random":
             nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
         else:
             raise NotImplementedError
 
         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
+            torch.rand(self.d_inner, device=self.dt_proj.bias.device, dtype=torch.float32) * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        ).clamp(min=self.dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias.copy_(inv_dt.to(dtype=self.dt_proj.bias.dtype))
         # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
         self.dt_proj.bias._no_reinit = True
 
-        # S4D real initialization
+        
+        # S4D real initialization for A_log
         A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=self.A_log.device),
             "n -> d n",
             d=self.d_inner,
         ).contiguous()
-        A_log = torch.log(A)  # Keep A_log in fp32
-        self.A_log = nn.Parameter(A_log)
-
+        self.A_log.copy_(torch.log(A))
+        
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))  # Keep in fp32
-
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        nn.init.ones_(self.D)
+        
+        # out_proj
+        utils.torch_default_init(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+        
+        # Jamba norms if present
+        if self.jamba_norm:
+            if hasattr(self.dt_layernorm, 'reset_parameters'):
+                self.dt_layernorm.reset_parameters()
+            if hasattr(self.b_layernorm, 'reset_parameters'):
+                self.b_layernorm.reset_parameters()
+            if hasattr(self.c_layernorm, 'reset_parameters'):
+                self.c_layernorm.reset_parameters()
 
     def forward(self, hidden_states, seq_idx=None, inference_params=None, mask= None, support_init_states = False, gmu_mems = None):
         """
@@ -204,7 +250,7 @@ class Mamba(nn.Module):
             if self.gmu_save:
                 z = z.transpose(-1,-2).contiguous()
 
-            if mask is not None and not self.use_cu_seqlen:
+            if mask is not None and not self.use_cu_seqlen and (not (self.use_triton and self.training)):
                 x = x * mask.unsqueeze(1)
             # Compute short convolution
             ox = x
@@ -236,7 +282,7 @@ class Mamba(nn.Module):
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 conv_state.copy_(F.pad(ox, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
-            if mask is not None and not self.use_cu_seqlen:
+            if mask is not None and not self.use_cu_seqlen and (not (self.use_triton and self.training)):
                 x = x * mask.unsqueeze(1)
             # print(mask[0,:])
             # We're careful here about the layout, to avoid extra transposes.
@@ -253,13 +299,14 @@ class Mamba(nn.Module):
             B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
             assert self.activation in ["silu", "swish"]
-            if support_init_states and ssm_state is not None:
+            if self.use_triton or (support_init_states and ssm_state is not None):
                 dt = F.softplus(dt + self.dt_proj.bias.float()[:, None])
                 x = x.transpose(-1, -2).contiguous()
                 dt = dt.transpose(-1, -2).contiguous()
                 B = B.transpose(-1,-2).contiguous()
                 C = C.transpose(-1,-2).contiguous()
-                z = z.transpose(-1,-2).contiguous()
+                if not self.gmu_save:
+                    z = z.transpose(-1,-2).contiguous()
                 o = triton_selective_scan_sequential(
                     x,
                     dt,
@@ -270,7 +317,10 @@ class Mamba(nn.Module):
                     initial_state= ssm_state,
                 )       
                 o, last_state = o     
-                ssm_state.copy_(last_state)
+                if ssm_state is not None:
+                    ssm_state.copy_(last_state)
+                if self.gmu_save:
+                    gmu_mems = o
                 y = swiglu(z, o)
             else:
                 if self.use_cu_seqlen:

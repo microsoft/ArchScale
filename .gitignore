@@ -21,4 +21,10 @@ datasets/
 hf_version/
 *.log
 *.json
-!assets/shooting_stars.png
+!assets/
+paper/
+datasets/
+legacy_scripts/
+legacy_plots/
+lit_gpt/megablocks/
+hf_coder/

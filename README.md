@@ -11,9 +11,14 @@ ArchScale is a comprehensive toolkit for training and evaluating neural language
 
 
 ## Updates
-- [Sept. 18] Phi-4-mini-flash has been accepted by NeurIPS 2025!
-- [July 18] Released the code for large-scale pre-training of Phi-4-mini-flash!
-- [July 9] Released the code for training [Decoder-Hybrid-Decoder Architectures](https://aka.ms/flashreasoning-paper) ([poster](assets/sambay_poster.pdf)) with μP++, and the model checkpoint for [Phi-4-mini-flash-reasoning](https://huggingface.co/microsoft/Phi-4-mini-flash-reasoning) ⚡
+- [Mar. 30] Released the code for MoE training with [HyperP](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf) (Hypersphere Parameterization) scaling, [SqrtGate](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf), and [MuonH](https://whenwen.github.io/wd_blog/public/hyperball-part-1.html) optimizer!
+<p align="center">
+  <img src="assets/scaling_comparison.png" alt="Scaling Comparison" width="100%" style="display:inline-block; vertical-align:middle;">
+</p>
+
+- [Sept. 25] Phi-4-mini-flash has been accepted by NeurIPS 2025!
+- [July 25] Released the code for large-scale pre-training of Phi-4-mini-flash!
+- [July 25] Released the code for training [Decoder-Hybrid-Decoder Architectures](https://aka.ms/flashreasoning-paper) ([poster](assets/sambay_poster.pdf)) with μP++, and the model checkpoint for [Phi-4-mini-flash-reasoning](https://huggingface.co/microsoft/Phi-4-mini-flash-reasoning)
 <p align="center">
   <img src="assets/sambay_arch.png" alt="SambaY Architecture" width="45%" style="display:inline-block; vertical-align:middle; margin-right:2%;">
   <img src="assets/scaling_data_1B_mup_abl_tie.png" alt="scaling_data_1B_mup_abl_tie" width="45%" style="display:inline-block; vertical-align:middle;">
@@ -21,31 +26,59 @@ ArchScale is a comprehensive toolkit for training and evaluating neural language
 
 ## Features
 
-- **Architectures**: Transformers, various SSM/attention/hybrid architectures, [Gated Memory Unit](https://aka.ms/flashreasoning-paper), [YOCO](https://arxiv.org/abs/2405.05254), [Differential Attention](https://arxiv.org/pdf/2410.05258).
-- **Scaling Laws**: [μP++](https://aka.ms/flashreasoning-paper), μP, Chinchilla FLOPs scaling, and various experimental scaling laws for batch size, weight decay, etc.
-- **Optimizers**: Muon, AdamW, Hybrid Optimizers.
-- **Research-Friendly**: Easy adding/modifying architectures/scaling-laws/optimizers/scheduling/initialization, [WYSIWYG](https://en.wikipedia.org/wiki/WYSIWYG) philosophy for experiments logging. 
-- **Performance**: End2end torch.compile training, clean & correct [Lightning Fabric](https://github.com/Lightning-AI/pytorch-lightning) package for FSDP distributed training, mixed precision, tensor parallelism and experimental fp8 support.
-- **Training**: Simple data mixture support, packed dataset with pre-tokenization, variable-length training for long-context, stable large vocabulary training with fused kernel.
-- **Evaluation**: Simple support for likelihood/generation based evaluation, long-context evaluation on Phonebook and RULER, scaling curve fitting and comparisons.
+- **Architectures**: Transformers (MHA/GQA), various SSM/attention modules, [Gated Memory Unit](https://aka.ms/flashreasoning-paper), [YOCO](https://arxiv.org/abs/2405.05254), [Differential Attention](https://arxiv.org/pdf/2410.05258) and flexible hybrid stacks (SambaY, Phi-4-mini-Flash, etc.).
+- **Mixture-of-Experts**: Fine-grained token-choice routing with [SonicMoE](https://github.com/microsoft/SonicMoE) acceleration, shared experts, [SqrtGate](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf) and global auxiliary load-balancing loss.
+- **Scaling Laws**: [HyperP](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf), [μP++](https://aka.ms/flashreasoning-paper), μP, Chinchilla FLOPs scaling, data scaling, and scaling laws for batch size, weight decay, and MoE granularity.
+- **Optimizers**: [MuonH](https://whenwen.github.io/wd_blog/public/hyperball-part-1.html), [Muon](lit_gpt/optim/muon.py), AdamW, and hybrid optimizer support.
+- **Research-Friendly**: Easy adding/modifying architectures/scaling-laws/optimizers/scheduling/initialization, [WYSIWYG](https://en.wikipedia.org/wiki/WYSIWYG) philosophy for experiments logging.
+- **Performance**: 🚀 Flash-Attention 4 + SonicMoE + FSDP2 distributed training, mixed precision, FP8/MXFP8 via [TransformerEngine](https://github.com/NVIDIA/TransformerEngine), activation checkpointing, and CPU offloading.
+- **Training**: Data mixture support (JSON config), packed dataset with pre-tokenization, variable-length training for long-context, fused cross-entropy for large vocabulary stability, batch size ramp-up scheduling, and orthogonal/diagonal weight initialization.
+- **Evaluation**: [lm-eval](https://github.com/EleutherAI/lm-evaluation-harness) integration for standard NLP benchmarks, long-context evaluation on RULER and Phonebook, [Proof-Pile](eval_proofpile.py) perplexity evaluation, [LightEval](eval_reason/)-based reasoning evaluation (AIME, MATH-500, GPQA), and scaling curve fitting via [plotting scripts](plots/).
+
+## Installation
+
+We provide [`install.sh`](install.sh) for bootstrapping the training environment. The script auto-detects GPU type (GB200/B100 vs H100/H200) and installs the appropriate PyTorch wheel along with all dependencies:
+
+```bash
+bash install.sh
+source .venv/bin/activate
+```
+
+This installs PyTorch, Lightning, Flash Attention (v2/v3/v4), TransformerEngine, Mamba, causal-conv1d, flash-linear-attention, SonicMoE, and other required packages.
 
 ## Pretraining
 
-We provide the [`Dockerfile`](Dockerfile) for setting up the training and evaluation environments. One can refer to the [Samba](https://github.com/microsoft/Samba/?tab=readme-ov-file#data-preparation) codebase for SlimPajama data tokenization. We also provide the pre-tokenized SlimPajama data [here](https://huggingface.co/datasets/jsun/slimpajama_Llama2_Tokenizer).
+One can refer to the [Samba](https://github.com/microsoft/Samba/?tab=readme-ov-file#data-preparation) codebase for SlimPajama data tokenization. We also provide the pre-tokenized SlimPajama data [here](https://huggingface.co/datasets/jsun/slimpajama_Llama2_Tokenizer).
 
-### Pretrain Phi4-mini-Flash
 
-To pre-train on 5T high quality data tokenized with `microsoft/Phi-4-mini-flash-reasoning`, we can use the following script to launch the job on 1K GPUs with standard parametrization:
+### MoE Training
+
+Train Mixture-of-Experts models with SonicMoE acceleration:
+
 ```bash
-export LIGHTNING_ARTIFACTS_DIR='path/to/output_dir'
-torchrun --nnodes=128 --nproc_per_node=8 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
-    --train_data_dir path/to/phi4/data \
-    --base_hps.eta0=5e-4 --base_hps.b0=8388608 --base_hps.warmup_tokens0=25_165_824_000 \
-    --ctx_len 8192 --max_tokens 5e12 --resume="auto" \
-    --train_model phi4miniflash --depth 32 \
-    --train_name scaling
+torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
+    --train_data_dir path/to/slim_pajama/data  --val_data_dir path/to/slim_pajama/data \
+    --train_model transformer_gqa4_h2_moe --depth 8 \
+    --sparsity 8 --top_k 4 --share_expert true --global_aux true --sqrt_gate true \
+    --train_name v2scale_mup_muonh_ga_qknorm_sgate_shexp --fsdp2 true
 ```
-We generally recommend also trying a cleaner architecture with `--train_model sambayda` (need to change the vocab size to 200064) and `--depth 24`, together with μP++ using `--train_name scaling_mup_tie` for better performance and training stability.
+
+Key MoE options include `--sparsity` (number of experts = sparsity * top_k), `--top_k` (experts per token), `--share_expert` (one shared dense expert), `--global_aux` (global load-balancing loss), and `--sqrt_gate` (SqrtGate for stable MoE granularity scaling under hypersphere optimization). MoE FLOPs scaling is supported with the same μP++ and hyperP transfer:
+
+```bash
+for depth in 8 12 16 20 24; do
+    torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
+        --train_data_dir path/to/slim_pajama/data  --val_data_dir path/to/slim_pajama/data \
+        --train_model transformer_gqa4 --depth ${depth} \
+        --sparsity 8 --top_k 4 --share_expert true --global_aux true --sqrt_gate true \
+        --train_name v2scale_mup_muonh_ga_qknorm_sgate_shexp  --fsdp2 true
+done
+```
+
+This trains the MoE model up-to 22.9B total parameters.
+
+See [launch_scripts/](launch_scripts/) for more templates on MoE/dense model training and hyperparameter tuning with various scaling and ablation configurations explored in the [paper](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf).
+
 
 ### Scaling FLOPs
 
@@ -59,7 +92,7 @@ for depth in 8 12 16 20 24; do
         --train_name scaling_mup
 done
 ```
-In the backend, a dataclass [`BaseHyperparameters`](pretrain.py#L44) defines the optimization related HyperParameters (HPs) for a d16 (depth=16) model, and the scaling laws defined in [`setup`](pretrain.py#L129) function will transfer these HPs to the actual HPs used at the target depth such as d8, d12 or d24. After the training finished, we can use `plot_flops_scaling.py` to fit the scaling curves, and comparing the fitted scaling parameters between different architectures. 
+In the backend, a dataclass [`BaseHyperparameters`](pretrain.py#L83) defines the optimization related HyperParameters (HPs) for a d8 (depth=8) model, and the scaling laws defined in [`setup`](pretrain.py#L172) function will transfer these HPs to the actual HPs used at the target depth such as d12, d16 or d24. After the training finished, we can use the [plotting scripts](plots/) to fit the scaling curves and compare the fitted scaling parameters between different architectures.
 
 ### Scaling Data
 
@@ -73,19 +106,6 @@ for tok in 1e11 2e11 3e11 4e11 5e11 6e11; do
         --train_name scaling_mup_tie
 done
 ```
-
-### Hyper-parameters Tuning
-We can also easily sweep the base HPs with the following scripts.
-
-```bash
-for lr in 4e-4 1e-4 1e-3; do
-    torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
-        --train_data_dir path/to/slim_pajama/data  --val_data_dir path/to/slim_pajama/data \
-        --train_model transformer --depth 8 --base_hps.eta0=${lr} \
-        --train_name scaling_mup
-done
-```
-Note that in this case, the learning rate is tuned for the d16, 1.0B model with 100B training tokens, but the actual training is conducted at a d8 model with around 12B tokens, thanks to μP++ for scaling down the computation cost of HPs sweeping. Models are defined in [`lit_gpt/config.py`](lit_gpt/config.py) with architecture-specific HPs.
 
 
 ## Long-Context Training
@@ -123,6 +143,19 @@ accelerate launch eval.py --model ArchScale \
 ```
 The script will infer the μP++ and architecture modification based on name of ckpt path.
 
+### Proof-Pile Evaluation
+
+Evaluate long-context perplexity using the [Proof-Pile](https://huggingface.co/datasets/hoskinson-center/proof-pile) dataset with sliding window inference (following LongLoRA):
+
+```bash
+python eval_proofpile.py \
+    --checkpoint_path path/to/checkpoint.pth \
+    --config "sambay_d16" \
+    --seq_length 32768 \
+    --sliding_window 256 \
+    --batch_size 1
+```
+
 ### Long-Context Evaluation
 
 #### RULER Benchmark
@@ -152,25 +185,46 @@ python eval_phonebook.py \
 
 ### Reasoning Evaluation
 
-Evaluate reasoning capabilities on mathematical and scientific tasks using `eval_reason.sh`:
+Evaluate reasoning capabilities on mathematical and scientific tasks (AIME, MATH-500, GPQA) using [LightEval](https://github.com/huggingface/lighteval) with vLLM backend:
 
 ```bash
-./eval_reason.sh  microsoft/Phi-4-mini-flash-reasoning aime24 output_dir
+./eval_reason/eval_reason.sh 42 microsoft/Phi-4-mini-flash-reasoning aime24 output_dir
 ```
 
-The reasoning evaluation uses vLLM backend with configurable generation parameters and supports multi-GPU evaluation. The script requires extra dependencies on `math-verify==0.7.0` and `lighteval==0.10.0`. We currently provide the vLLM inference support in this [PR](https://github.com/vllm-project/vllm/pull/20702).
+The reasoning evaluation supports multi-GPU evaluation with configurable generation parameters (temperature, top-p, max tokens). The script requires `lighteval` and `math-verify` dependencies. We currently provide the vLLM inference support in this [PR](https://github.com/vllm-project/vllm/pull/20702).
+
+### Scaling Analysis
+
+The [plots/](plots/) directory provides scripts for fitting and visualizing scaling curves:
+
+```bash
+python plots/plot_moe_scaling_comparison.py   # MoE FLOPs scaling curves
+python plots/plot_scaling_comparison.py        # Dense model scaling comparison
+python plots/plot_muonh_comparison.py          # MuonH vs baseline comparison
+python plots/plot_bsz_scaling.py               # Batch size scaling analysis
+python plots/plot_stability.py                 # Training stability analysis
+```
 
 ## Citation
 
 If you find our work useful, please consider citing:
 
 ```bibtex
+@article{ren2026rethinking,
+  title={Rethinking Language Model Scaling under Transferable Hypersphere Optimization},
+  author={Liliang Ren and Yang Liu and Yelong Shen and Weizhu Chen},
+  year={2026},
+  url={https://github.com/microsoft/ArchScale}
+}
+
+
 @software{archscale2025,
   title={ArchScale: Simple and Scalable Pretraining for Neural Architecture Research},
   author={Liliang Ren and Zichong Li and Yelong Shen},
   year={2025},
   url={https://github.com/microsoft/ArchScale}
 }
+
 
 @article{ren2025decoder,
   title={Decoder-Hybrid-Decoder Architecture for Efficient Reasoning with Long Generation},
@@ -185,11 +239,12 @@ If you find our work useful, please consider citing:
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
-
+- [SonicMoE](https://github.com/microsoft/SonicMoE)
 - [Samba](https://github.com/microsoft/Samba/)
 - [LitGPT](https://github.com/Lightning-AI/litgpt)
 - [TinyLlama](https://github.com/jzhang38/TinyLlama)
 - [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
+- [TransformerEngine](https://github.com/NVIDIA/TransformerEngine)
 
 ---
 

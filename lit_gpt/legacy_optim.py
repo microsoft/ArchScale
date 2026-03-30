@@ -117,32 +117,38 @@ class Muon_fsdp2(torch.optim.Optimizer):
         yield from zip(list_p, list_g, list_m)
 
     @torch.no_grad()
-    def step(self, *, prefetch_factor: int = 8):  # <-- changeme to 1 if you have numerical bugs
-        # fsdp sharding mesh dim is always last
-        r, ws = self.mesh.get_local_rank(-1), self.mesh.size(-1)
+    def step(self, *, prefetch_factor: int = 8):
+        pg_last = self.mesh.get_group(-1)
+        r_local = self.mesh.get_local_rank(-1)                 # 0..ws-1 within subgroup
+        ws = dist.get_world_size(group=pg_last)
         dq = deque()
 
-        def deferred_work(p, g, g_full_block, spec, lr, weight_decay, src_rank, rank):
-            if rank == src_rank:
+        def deferred_work(p, g, g_full_block, spec, lr, weight_decay, src_local, my_local):
+            src_global = dist.get_global_rank(pg_last, src_local)   # <<< NEW
+            if my_local == src_local:
                 chunks = list(g_full_block.chunk(ws, dim=0))
-                worker = scatter(g.to_local(), chunks, src=src_rank, async_op=True)
+                worker = scatter(
+                    g.to_local(), chunks, src=src_global, async_op=True, group=pg_last
+                )
             else:
-                worker = scatter(g.to_local(), None, src=src_rank, async_op=True) 
+                worker = scatter(
+                    g.to_local(), None, src=src_global, async_op=True, group=pg_last
+                )
 
-       
-            # Apply weight decay after NS (matching reference implementation)
             p.mul_(1 - lr * weight_decay)
             assert weight_decay > 0, f"Muon weight decay must be positive, got {weight_decay}"
-            # update parameter with NS'd grad
-            worker.wait()  # wait for the scatter to finish
-            if self.mode == "normal":
+
+            worker.wait()
+            if self.mode == "spectral":
+                lr_scale = (p.size(-2) / p.size(-1)) ** 0.5
+            elif self.mode == "normal":
                 lr_scale = max(1, p.size(-2) / p.size(-1)) ** 0.5
-            elif self.mode == "old":
-                lr_scale = 0.2 * max(p.size(-2) , p.size(-1)) ** 0.5
-            elif self.mode == "old_large":
-                lr_scale = 0.4 * max(p.size(-2) , p.size(-1)) ** 0.5
-            elif self.mode == "old_larger":
-                lr_scale = 0.8 * max(p.size(-2) , p.size(-1)) ** 0.5
+            elif self.mode == "moonlight":
+                lr_scale = 0.2 * max(p.size(-2), p.size(-1)) ** 0.5
+            elif self.mode == "moonlight_large":
+                lr_scale = 0.4 * max(p.size(-2), p.size(-1)) ** 0.5
+            elif self.mode == "moonlight_larger":
+                lr_scale = 0.8 * max(p.size(-2), p.size(-1)) ** 0.5
             elif self.mode == "liming":
                 lr_scale = 0.25 * (p.size(0) * p.size(1))**0.5 / (g.norm() + 1e-8)
             p.add_(g, alpha=-lr * lr_scale)
@@ -151,23 +157,29 @@ class Muon_fsdp2(torch.optim.Optimizer):
         for group in self.param_groups:
             for p, g, m in self.filter_group(group):
                 spec = g._spec
-                dest_rank = i  % ws
-                if dest_rank == r:
+                dest_local = i % ws                                  # subgroup-local
+                dest_global = dist.get_global_rank(pg_last, dest_local)  # <<< NEW
+
+                if dest_local == r_local:
                     gather_lists = [torch.zeros_like(g.to_local()) for _ in range(ws)]
-                    gather(g.to_local(), gather_lists, dst=dest_rank, async_op=False) 
+                    gather(
+                        g.to_local(), gather_lists, dst=dest_global, async_op=False, group=pg_last
+                    )
                     g_full_block = torch.cat(gather_lists, dim=0)
                     g_full_block.copy_(zeropower_via_newtonschulz(g_full_block, steps=group["ns_steps"]))
                     g_full_block = g_full_block.view_as(p).type_as(p)
                 else:
-                    
                     g_local = g.to_local()
-                    gather(g_local, None, dst=dest_rank, async_op=False)
+                    gather(
+                        g_local, None, dst=dest_global, async_op=False, group=pg_last
+                    )
                     g_full_block = None
-                    
-                dq.append([p, g, g_full_block, spec, group["lr"], group["weight_decay"], dest_rank, r])
+
+                dq.append([p, g, g_full_block, spec, group["lr"], group["weight_decay"], dest_local, r_local])
                 if len(dq) > prefetch_factor:
                     deferred_work(*dq.popleft())
                 i += 1
+
         for ls in dq:
             deferred_work(*ls)
 

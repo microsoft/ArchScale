@@ -1,0 +1,1 @@
+vllm serve /mnt/aimsllmeus2/liliang/phi4_r1s_new/checkpoint-5304/ --host 127.0.0.1 --port 26500 --trust-remote-code --served-model-name phi3samba --tensor-parallel-size 1 --max-model-len 65536 --max-seq-len-to-capture 65536 --enable-chunked-prefill false --no-enable-prefix-caching

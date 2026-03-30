@@ -123,25 +123,21 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
 
         self.act = nn.SiLU()
 
-        # Initialize log dt bias
-        dt = torch.exp(
-            torch.rand(self.nheads, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        )
-        dt = torch.clamp(dt, min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        self.dt_bias = nn.Parameter(inv_dt)
-        # Just to be explicit. Without this we already don't put wd on dt_bias because of the check
-        # name.endswith("bias") in param_grouping.py
+        # Store initialization parameters
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.dt_init_floor = dt_init_floor
+        self.A_init_range = A_init_range
 
+        # Initialize dt_bias as empty parameter (will be initialized in reset_parameters)
+        self.dt_bias = nn.Parameter(torch.empty(self.nheads, **factory_kwargs))
+
+        # A_log parameter
         assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
-        A = torch.empty(self.nheads, dtype=torch.float32, device=device).uniform_(*A_init_range)
-        A_log = torch.log(A).to(dtype=dtype)
-        self.A_log = nn.Parameter(A_log)
+        self.A_log = nn.Parameter(torch.empty(self.nheads, dtype=torch.float32, device=device))
 
         # D "skip" parameter
-        self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
+        self.D = nn.Parameter(torch.empty(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
 
         if self.rmsnorm:
             assert RMSNormGated is not None
@@ -154,6 +150,51 @@ class Mamba2(nn.Module, PyTorchModelHubMixin):
             self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
                                               process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                               **factory_kwargs)
+
+    @torch.no_grad()
+    def reset_parameters(self) -> None:
+        """Initialize Mamba2 parameters."""
+        import utils
+        
+        # Initialize in_proj
+        utils.torch_default_init(self.in_proj.weight)
+        if self.in_proj.bias is not None:
+            nn.init.zeros_(self.in_proj.bias)
+        
+        # Initialize conv1d
+        if self.conv_init is not None:
+            nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+        else:
+            utils.torch_default_init(self.conv1d.weight)
+        if self.conv1d.bias is not None:
+            nn.init.zeros_(self.conv1d.bias)
+        
+        # Initialize dt_bias so that F.softplus(dt_bias) is between dt_min and dt_max
+        dt = torch.exp(
+            torch.rand(self.nheads, device=self.dt_bias.device, dtype=torch.float32) 
+            * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        )
+        dt = torch.clamp(dt, min=self.dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        self.dt_bias.copy_(inv_dt.to(dtype=self.dt_bias.dtype))
+        
+        # Initialize A_log
+        A = torch.empty(self.nheads, dtype=torch.float32, device=self.A_log.device).uniform_(*self.A_init_range)
+        self.A_log.copy_(torch.log(A))
+        
+        # Initialize D "skip" parameter
+        nn.init.ones_(self.D)
+        
+        # Initialize norm if present
+        if self.rmsnorm and hasattr(self.norm, 'reset_parameters'):
+            self.norm.reset_parameters()
+        
+        # Initialize out_proj
+        utils.torch_default_init(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, u, seqlen=None, seq_idx=None, cu_seqlens=None, inference_params=None, mask= None, support_init_states = False, gmu_mems = None):
         """
