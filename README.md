@@ -27,7 +27,7 @@ ArchScale is a comprehensive toolkit for training and evaluating neural language
 ## Features
 
 - **Architectures**: Transformers (MHA/GQA), various SSM/attention modules, [Gated Memory Unit](https://aka.ms/flashreasoning-paper), [YOCO](https://arxiv.org/abs/2405.05254), [Differential Attention](https://arxiv.org/pdf/2410.05258) and flexible hybrid stacks (SambaY, Phi-4-mini-Flash, etc.).
-- **Mixture-of-Experts**: Fine-grained token-choice routing with [SonicMoE](https://github.com/microsoft/SonicMoE) acceleration, shared experts, [SqrtGate](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf) and global auxiliary load-balancing loss.
+- **Mixture-of-Experts**: Fine-grained token-choice routing with [SonicMoE](https://github.com/Dao-AILab/sonic-moe) acceleration, shared experts, [SqrtGate](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf) and global auxiliary load-balancing loss.
 - **Scaling Laws**: [HyperP](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf), [μP++](https://aka.ms/flashreasoning-paper), μP, Chinchilla FLOPs scaling, data scaling, and scaling laws for batch size, weight decay, and MoE granularity.
 - **Optimizers**: [MuonH](https://whenwen.github.io/wd_blog/public/hyperball-part-1.html), [Muon](lit_gpt/optim/muon.py), AdamW, and hybrid optimizer support.
 - **Research-Friendly**: Easy adding/modifying architectures/scaling-laws/optimizers/scheduling/initialization, [WYSIWYG](https://en.wikipedia.org/wiki/WYSIWYG) philosophy for experiments logging.
@@ -239,7 +239,7 @@ If you find our work useful, please consider citing:
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
-- [SonicMoE](https://github.com/microsoft/SonicMoE)
+- [SonicMoE](https://github.com/Dao-AILab/sonic-moe)
 - [Samba](https://github.com/microsoft/Samba/)
 - [LitGPT](https://github.com/Lightning-AI/litgpt)
 - [TinyLlama](https://github.com/jzhang38/TinyLlama)
