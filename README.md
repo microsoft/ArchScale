@@ -11,7 +11,7 @@ ArchScale is a comprehensive toolkit for training and evaluating neural language
 
 
 ## Updates
-- [Mar. 30] Released the code for MoE training with [HyperP](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf) (Hypersphere Parameterization) scaling, [SqrtGate](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf), and [MuonH](https://whenwen.github.io/wd_blog/public/hyperball-part-1.html) optimizer!
+- [Mar. 30] Released the code for MoE training with [HyperP](https://arxiv.org/abs/2603.28743) (Hypersphere Parameterization) scaling, [SqrtGate](https://arxiv.org/abs/2603.28743), and [MuonH](https://whenwen.github.io/wd_blog/public/hyperball-part-1.html) optimizer!
 <p align="center">
   <img src="assets/scaling_comparison.png" alt="Scaling Comparison" width="100%" style="display:inline-block; vertical-align:middle;">
 </p>
@@ -27,8 +27,8 @@ ArchScale is a comprehensive toolkit for training and evaluating neural language
 ## Features
 
 - **Architectures**: Transformers (MHA/GQA), various SSM/attention modules, [Gated Memory Unit](https://aka.ms/flashreasoning-paper), [YOCO](https://arxiv.org/abs/2405.05254), [Differential Attention](https://arxiv.org/pdf/2410.05258) and flexible hybrid stacks (SambaY, Phi-4-mini-Flash, etc.).
-- **Mixture-of-Experts**: Fine-grained token-choice routing with [SonicMoE](https://github.com/Dao-AILab/sonic-moe) acceleration, shared experts, [SqrtGate](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf) and global auxiliary load-balancing loss.
-- **Scaling Laws**: [HyperP](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf), [μP++](https://aka.ms/flashreasoning-paper), μP, Chinchilla FLOPs scaling, data scaling, and scaling laws for batch size, weight decay, and MoE granularity.
+- **Mixture-of-Experts**: Fine-grained token-choice routing with [SonicMoE](https://github.com/Dao-AILab/sonic-moe) acceleration, shared experts, [SqrtGate](https://arxiv.org/abs/2603.28743) and global auxiliary load-balancing loss.
+- **Scaling Laws**: [HyperP](https://arxiv.org/abs/2603.28743), [μP++](https://aka.ms/flashreasoning-paper), μP, Chinchilla FLOPs scaling, data scaling, and scaling laws for batch size, weight decay, and MoE granularity.
 - **Optimizers**: [MuonH](https://whenwen.github.io/wd_blog/public/hyperball-part-1.html), [Muon](lit_gpt/optim/muon.py), AdamW, and hybrid optimizer support.
 - **Research-Friendly**: Easy adding/modifying architectures/scaling-laws/optimizers/scheduling/initialization, [WYSIWYG](https://en.wikipedia.org/wiki/WYSIWYG) philosophy for experiments logging.
 - **Performance**: 🚀 Flash-Attention 4 + SonicMoE + FSDP2 distributed training, mixed precision, FP8/MXFP8 via [TransformerEngine](https://github.com/NVIDIA/TransformerEngine), activation checkpointing, and CPU offloading.
@@ -59,7 +59,7 @@ Train Mixture-of-Experts models with SonicMoE acceleration:
 torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
     --train_data_dir path/to/slim_pajama/data  --val_data_dir path/to/slim_pajama/data \
     --train_model transformer_gqa4_h2_moe --depth 8 \
-    --sparsity 8 --top_k 4 --share_expert true --global_aux true --sqrt_gate true \
+    --sparsity 8 --top_k 8 --share_expert true --global_aux true --sqrt_gate true \
     --train_name v2scale_mup_muonh_ga_qknorm_sgate_shexp --fsdp2 true
 ```
 
@@ -67,17 +67,22 @@ Key MoE options include `--sparsity` (number of experts = sparsity * top_k), `--
 
 ```bash
 for depth in 8 12 16 20 24; do
-    torchrun --nnodes=1 --nproc_per_node=8 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
+    act_ckpt=false
+    if [[ ${depth} -ge 20 ]]; then
+      act_ckpt=true
+    fi
+    torchrun --nnodes=8 --nproc_per_node=4 --rdzv_backend=c10d  --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} pretrain.py \
         --train_data_dir path/to/slim_pajama/data  --val_data_dir path/to/slim_pajama/data \
-        --train_model transformer_gqa4 --depth ${depth} \
-        --sparsity 8 --top_k 4 --share_expert true --global_aux true --sqrt_gate true \
+        --train_model transformer_gqa4_h2_moe --depth ${depth} --base_hps.warmup_tokens=0 \
+        --sparsity 8 --top_k 8 --share_expert true --global_aux true --sqrt_gate true \
+        --base_hps.t0=10.4e9 --base_hps.min_lr_mult=0.1 --resume="auto" --micro_bsz=16 --act_ckpt=${act_ckpt} \
         --train_name v2scale_mup_muonh_ga_qknorm_sgate_shexp  --fsdp2 true
 done
 ```
 
-This trains the MoE model up-to 22.9B total parameters.
+This trains the MoE model up-to 22.9B total parameters on 32xGB200.
 
-See [launch_scripts/](launch_scripts/) for more templates on MoE/dense model training and hyperparameter tuning with various scaling and ablation configurations explored in the [paper](assets/Rethinking_Language_Model_Scaling_under_Transferable_Hypersphere_Optimization_final.pdf).
+See [launch_scripts/](launch_scripts/) for more templates on MoE/dense model training and hyperparameter tuning with various scaling and ablation configurations explored in the [paper](https://arxiv.org/abs/2603.28743).
 
 
 ### Scaling FLOPs
@@ -211,12 +216,11 @@ If you find our work useful, please consider citing:
 
 ```bibtex
 @article{ren2026rethinking,
-  title={Rethinking Language Model Scaling under Transferable Hypersphere Optimization},
-  author={Liliang Ren and Yang Liu and Yelong Shen and Weizhu Chen},
-  year={2026},
-  url={https://github.com/microsoft/ArchScale}
+  title   = {Rethinking Language Model Scaling under Transferable Hypersphere Optimization},
+  author  = {Liliang Ren and Yang Liu and Yelong Shen and Weizhu Chen},
+  year    = {2026},
+  journal = {arXiv preprint arXiv: 2603.28743}
 }
-
 
 @software{archscale2025,
   title={ArchScale: Simple and Scalable Pretraining for Neural Architecture Research},
@@ -224,7 +228,6 @@ If you find our work useful, please consider citing:
   year={2025},
   url={https://github.com/microsoft/ArchScale}
 }
-
 
 @article{ren2025decoder,
   title={Decoder-Hybrid-Decoder Architecture for Efficient Reasoning with Long Generation},
